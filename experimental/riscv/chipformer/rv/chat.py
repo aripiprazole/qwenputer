@@ -7,14 +7,16 @@ Decoding is greedy and transparent to chip tokens (as BatchDecoder's fp + tc): a
 runs through the chip layers only, so Qwen's layers, caches and RoPE positions see the text
 alone; a text token runs through every layer. At every position the next token is the
 circuit's when its output code is set (the owner), else Qwen's argmax over its own vocabulary.
-The firmware (an ELF, parked at its first exit ecall) is a state snapshot written into the chip
-layers' recurrent states after the prompt's prefill (rv/firmware.py, rv/hf.py).
+Normal chat boots the firmware through the HF chip layers, parks at its first exit ecall,
+and restores that recurrent-state snapshot after each prompt's prefill. ``--check`` enables
+the reference bootstrap, lockstep validation and replay.
 
 ``--check`` replays the whole stream through the IR evaluator and the reference machine: every
 circuit-owned token must equal the IR's prediction and the reference's next token.
 """
 
 import argparse
+from dataclasses import dataclass
 import json
 import time
 from pathlib import Path
@@ -25,6 +27,7 @@ import torch
 from chipformer.rv import bridge as BR
 from chipformer.rv import core, elf, hf, ref
 from chipformer.rv import spec as S
+from chipformer.rv.decode import CodeDecoder
 
 CALC_TOOL = {"type": "function", "function": {
     "name": "calc",
@@ -38,18 +41,228 @@ CALC_TOOL = {"type": "function", "function": {
         "required": ["expression"]}}}
 
 
+@dataclass(frozen=True)
+class FirmwareState:
+    """Parked firmware produced by the HF chip layers, reusable across conversations."""
+
+    heads: tuple[torch.Tensor, ...]
+    steps: int
+
+    @classmethod
+    def capture(cls, cache, layers, steps=0):
+        return cls(tuple(cache.layers[i].recurrent_states[0].clone() for i in range(layers)), steps)
+
+    def inject(self, cache):
+        for index, state in enumerate(self.heads):
+            target = cache.layers[index].recurrent_states[0]
+            if target.shape != state.shape:
+                raise ValueError("firmware state does not match the model's chip layers")
+            target.copy_(state)
+
+
+@dataclass(frozen=True)
+class ExecState:
+    """Parked firmware on the executor: every circuit head's state (as FirmwareState holds the
+    HF chip layers' recurrent states)."""
+
+    heads: tuple[torch.Tensor, ...]
+    steps: int
+
+
 class ExecRow:
-    """One conversation's circuit on the Triton executor (batch 1) with its own CUDA graph."""
+    """One conversation's circuit on the Triton executor (batch 1) with its own CUDA graph.
+
+    Runs of chip tokens go through a device token loop: BLOCK circuit steps captured as one
+    graph, each step's predicted token embedded on the device as the next step's input, so the
+    host syncs once per block instead of once per token. A block stops being valid at the first
+    prediction outside the chip vocabulary (an echoed Qwen token, or no owner): the heads are
+    put back to the block's start and only the valid steps are replayed one by one."""
+
+    BLOCK = 256
 
     def __init__(self, chat: "RvChat") -> None:
         from chipformer.rv.tritonexec import Executor2
 
         self.chat = chat
-        self.ex = Executor2(chat.c, 1, chat.dev)
+        cuda = torch.device(chat.dev).type == "cuda"
+        self.ex = Executor2(chat.c, 1, chat.dev, fuse=chat.fuse, pdl=cuda, early=cuda,
+                            direct=cuda)
+        if cuda:
+            self.ex.tune(self.ex.embed([S.tok("GO")]))
         self.heads = [st for st in self.ex.steps if st["kind"] == "head"]
         self.xbuf = torch.zeros(1, self.ex.D, device=chat.dev)
         self.kbuf = torch.zeros(len(chat.keep_cols), device=chat.dev)
         self.graph = None
+        self.loop = None
+        self.fused = cuda  # the device loop's decode + embedding as one Triton kernel
+
+    def save(self, steps: int = 0) -> ExecState:
+        return ExecState(tuple(st["S"][0].clone() for st in self.heads), steps)
+
+    def load(self, state: ExecState) -> None:
+        if len(state.heads) != len(self.heads):
+            raise ValueError("firmware state does not match the circuit")
+        for st, s in zip(self.heads, state.heads):
+            st["S"][0].copy_(s)
+
+    @torch.no_grad()
+    def _build_loop(self) -> None:
+        from chipformer.dsl.graph import ONE
+
+        chat, dev = self.chat, self.chat.dev
+        self.tab = chat.chip_table()  # [chip vocab, features] in ex.feat_ids order
+        self.fidx = torch.tensor(self.ex.feat_ids, device=dev)
+        self.ncode = len(chat.code_dims)
+        self.cur = torch.zeros(1, dtype=torch.long, device=dev)  # the input's chip index
+        self.out = torch.zeros(self.BLOCK, dtype=torch.long, device=dev)  # predicted model ids
+        self.backup = [(st["S"].clone(), st["hist"].clone()) for st in self.heads]
+        last = self.tab.shape[0] - 1
+
+        code_ix = chat.keep_ir[: self.ncode].contiguous()
+        tab = self.tab.contiguous()
+
+        def body():
+            if self.fused:  # one kernel between steps (Executor2.next_input)
+                args = dict(code_ix=code_ix, out=self.out, cur=self.cur, tab=tab,
+                            fidx=self.fidx, decoder=chat.decoder, v0=chat.v0, one=ONE)
+                self.ex.next_input(self.xbuf, i=0, decode=False, **args)
+                for i in range(self.BLOCK):
+                    self.ex.step(self.xbuf)
+                    self.ex.next_input(self.xbuf, i=i, **args)
+                return
+            for i in range(self.BLOCK):
+                self.xbuf.zero_()
+                self.xbuf[0, ONE:ONE + 1].fill_(1.0)  # (a kernel; no host copy in the graph)
+                self.xbuf[0].index_copy_(0, self.fidx, torch.index_select(self.tab, 0, self.cur)[0])
+                self.ex.step(self.xbuf)
+                code = torch.index_select(self.xbuf[0], 0, chat.keep_ir[: self.ncode])
+                nxt = chat.decoder(code)
+                self.out[i] = nxt
+                self.cur.copy_((nxt - chat.v0).clamp(0, last).view(1))
+
+        saved = [(st["S"].clone(), st["hist"].clone()) for st in self.heads]
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            body()
+        torch.cuda.current_stream().wait_stream(s)
+        self.loop = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.loop):
+            body()
+        for st, (S_, h) in zip(self.heads, saved):
+            st["S"].copy_(S_)
+            st["hist"].copy_(h)
+
+    @torch.no_grad()
+    def run_chip(self, first: int, limit: int, on_block=None, stop=None) -> tuple[list, int]:
+        """Feed the chip token ``first`` and then the circuit's own predictions while they stay
+        chip tokens. Returns (the inputs fed, starting with first; the last prediction): a
+        Qwen token or -1 / -2 when the run ended, a chip token when ``limit`` inputs were fed
+        or ``stop`` was set. ``on_block(ids)`` sees each block's inputs as it completes."""
+        chat = self.chat
+        if self.graph is None:
+            self._capture()
+        if self.loop is None:
+            self._build_loop()
+        if self.fused:
+            return self._run_chip_ahead(first, limit, on_block, stop)
+        inputs, head = [], first
+        while True:
+            self.cur.fill_(head - chat.v0)
+            for st, (bs, bh) in zip(self.heads, self.backup):
+                bs.copy_(st["S"])
+                bh.copy_(st["hist"])
+            self.loop.replay()
+            preds = self.out.tolist()
+            end = next((i for i, t in enumerate(preds) if t < chat.v0), None)
+            if end is None:
+                block = [head] + preds[:-1]
+                inputs += block
+                if on_block:
+                    on_block(block)
+                head = preds[-1]
+                if len(inputs) >= limit or (stop is not None and stop.is_set()):
+                    return inputs, head
+                continue
+            # the steps after `end` read a token that is not a chip token: undo the block and
+            # run its valid steps again (the same inputs, so the same predictions)
+            for st, (bs, bh) in zip(self.heads, self.backup):
+                st["S"].copy_(bs)
+                st["hist"].copy_(bh)
+            block = [head] + preds[:end]
+            for t in block:
+                keep = self.step(t)
+            last = chat.code_token(keep[: self.ncode])
+            if (last if last is not None else -1) != preds[end]:
+                raise RuntimeError("the replayed block diverged from the device loop")
+            inputs += block
+            if on_block:
+                on_block(block)
+            return inputs, preds[end]
+
+    def _keep(self, slot) -> None:
+        for st, (bs, bh) in zip(self.heads, self.backups[slot]):
+            bs.copy_(st["S"])
+            bh.copy_(st["hist"])
+
+    def _restore(self, slot) -> None:
+        for st, (bs, bh) in zip(self.heads, self.backups[slot]):
+            st["S"].copy_(bs)
+            st["hist"].copy_(bh)
+
+    def _launch_block(self, k: int) -> None:
+        """Block k on the stream: its start state into backup k % 2, the graph, and its
+        predictions on their way to a pinned host buffer (no host sync)."""
+        self._keep(k % 2)
+        self.loop.replay()
+        self.host_out[k % 2].copy_(self.out, non_blocking=True)
+        self.done[k % 2].record()
+
+    def _run_chip_ahead(self, first, limit, on_block, stop):
+        """run_chip with the next block launched before this one's predictions are read: the
+        graph's last kernel leaves the next input (cur) on the device, so block k + 1 runs
+        while the host checks block k. A block that ends the run discards the one after it:
+        the state goes back to block k's start (its backup) and the valid steps run again."""
+        chat = self.chat
+        if not hasattr(self, "backups"):
+            self.backups = [self.backup, [(S_.clone(), h.clone()) for S_, h in self.backup]]
+            self.host_out = [torch.zeros(self.BLOCK, dtype=torch.long).pin_memory()
+                             for _ in range(2)]
+            self.done = [torch.cuda.Event() for _ in range(2)]
+        inputs, head = [], first
+        self.cur.fill_(head - chat.v0)
+        self._launch_block(0)
+        k = 0
+        while True:
+            ahead = len(inputs) + 2 * self.BLOCK <= limit and not (stop is not None
+                                                                    and stop.is_set())
+            if ahead:
+                self._launch_block(k + 1)
+            self.done[k % 2].synchronize()
+            preds = self.host_out[k % 2].tolist()
+            end = next((i for i, t in enumerate(preds) if t < chat.v0), None)
+            if end is None:
+                block = [head] + preds[:-1]
+                inputs += block
+                if on_block:
+                    on_block(block)
+                head = preds[-1]
+                if not ahead:  # the limit or a stop: nothing runs past this block
+                    return inputs, head
+                k += 1
+                continue
+            torch.cuda.synchronize()  # the block after it (if launched) is done: discard it
+            self._restore(k % 2)
+            block = [head] + preds[:end]
+            for t in block:
+                keep = self.step(t)
+            last = chat.code_token(keep[: self.ncode])
+            if (last if last is not None else -1) != preds[end]:
+                raise RuntimeError("the replayed block diverged from the device loop")
+            inputs += block
+            if on_block:
+                on_block(block)
+            return inputs, preds[end]
 
     def _body(self):
         self.ex.step(self.xbuf)
@@ -73,10 +286,10 @@ class ExecRow:
             st["hist"].copy_(h)
 
     @torch.no_grad()
-    def start(self, ids: list[int]) -> None:
+    def start(self, ids: list[int], state: ExecState | None = None) -> None:
         """As the HF path does it: the prompt through the circuit from zero states, then every
-        head's state set to its init (the snapshot now in the circuit; hf.inject), the lag
-        windows kept."""
+        head's state set to its init (the snapshot now in the circuit; hf.inject) or to a
+        parked ``state``, the lag windows kept."""
         if self.graph is None:
             self._capture()
         for st in self.heads:
@@ -86,7 +299,10 @@ class ExecRow:
         for t in range(len(ids)):
             self.xbuf.copy_(emb[t:t + 1])
             self.graph.replay()
-        self.ex.load_init()
+        if state is None:
+            self.ex.load_init()
+        else:
+            self.load(state)
 
     @torch.no_grad()
     def step(self, ids: int) -> torch.Tensor:
@@ -98,7 +314,7 @@ class ExecRow:
 
 class RvChat:
     def __init__(self, path, device: str | None = None, fast: bool = True,
-                 executor: bool = False) -> None:
+                 executor: bool = False, fuse: bool = False) -> None:
         from transformers import AutoTokenizer, Qwen3_5ForCausalLM
 
         from chipformer.q35.fast import exact_matmuls
@@ -107,6 +323,10 @@ class RvChat:
         exact_matmuls()
         self.path = Path(path)
         self.meta = json.loads((self.path / "chipformer.json").read_text())
+        if self.meta.get("map", "p2") != S.MAP:
+            raise ValueError(f"checkpoint built for address map {self.meta.get('map', 'p2')!r}; "
+                             f"set QWENPUTER_RV_MAP to match (now {S.MAP!r})")
+        self.fuse = fuse
         self.dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model = Qwen3_5ForCausalLM.from_pretrained(self.path, dtype=torch.bfloat16)
         self.model = self.model.to(self.dev).eval()
@@ -118,6 +338,7 @@ class RvChat:
                                    cfg.intermediate_size), self.T)
         self.n_chip, self.v0 = self.meta["chip_layers"], self.meta["chip_token_offset"]
         self.code_dims = torch.tensor(self.meta["code_dims"], device=self.dev)
+        self.decoder = CodeDecoder(self.v0, self.T, device=self.dev)
         self.eos = {248046, 248044}
         self.fast = fast and self.dev == "cuda"
         # executor "verify": both chip paths, the HF view's hc checked against the executor's
@@ -155,8 +376,28 @@ class RvChat:
                 self.emb_cache[i] = r
         return torch.stack([self.emb_cache[i] for i in ids])
 
-    def _exec_start(self, ids: list[int]) -> None:
-        self.erow.start(ids)
+    def _exec_start(self, ids: list[int], state: "ExecState | None" = None) -> None:
+        self.erow.start(ids, state)
+
+    def chip_table(self) -> torch.Tensor:
+        """Every chip token's executor input features (ex.feat_ids order), on the device, for
+        the device token loop. The values are the circuit's token features (feature_value),
+        computed once and cached next to the checkpoint."""
+        ex = self.erow.ex
+        cache = self.path / f"chip_features.{S.MAP}.npy"
+        if cache.is_file():
+            tab = np.load(cache)
+        else:
+            tab = np.zeros((S.VOCAB, len(ex.feat_ids)), np.float32)
+            for j, d in enumerate(ex.feat_ids):
+                tab[:, j] = [float(self.c.feature_value(d, t)) for t in range(S.VOCAB)]
+            try:
+                np.save(cache, tab)
+            except OSError:
+                pass
+        if tab.shape != (S.VOCAB, len(ex.feat_ids)):
+            raise ValueError(f"{cache} does not match the circuit; delete it")
+        return torch.from_numpy(tab).to(self.dev)
 
     def _exec_step(self, ids: int) -> torch.Tensor:
         return self.erow.step(ids)
@@ -171,17 +412,17 @@ class RvChat:
 
     def code_token(self, code) -> int | None:
         """circuit_token from the output code values."""
-        code = code.float()
-        if not bool((code != 0).any()):
+        token = int(self.decoder(code))
+        if token == CodeDecoder.UNOWNED:
             return None
+        if token != CodeDecoder.INVALID:
+            return token
+        # Only malformed codes need their individual bits copied to the host.
         bits = (code > 0).long().tolist()
         nf = core.NFAM
         fid = sum(b << i for i, b in enumerate(bits[:nf]))
         p = sum(b << i for i, b in enumerate(bits[nf:]))
-        t = core.decode_code(fid, p, self.T)
-        if t < 0:
-            raise RuntimeError(f"the circuit predicts no token (family {fid}, payload {p})")
-        return t - S.TEXT_TOKEN if S.is_text(t) else self.v0 + t
+        raise RuntimeError(f"the circuit predicts no token (family {fid}, payload {p})")
 
     # --- the fast chip path ----------------------------------------------------------------
     def _build_fast(self) -> None:
@@ -241,6 +482,7 @@ class RvChat:
             h = self.cm.layers[L](h, position_embeddings=None, attention_mask=None,
                                   position_ids=None, past_key_values=self.ccache)
         self.g_out.copy_(h)
+        self.g_next.copy_(self.decoder(h[0, -1, self.code_dims]))
 
     @torch.no_grad()
     def _capture(self):
@@ -249,6 +491,7 @@ class RvChat:
         self.g_ids = torch.zeros((1, 1), dtype=torch.long, device=self.dev)
         self.g_out = torch.zeros((1, 1, self.model.config.hidden_size), dtype=torch.bfloat16,
                                  device=self.dev)
+        self.g_next = torch.empty((), dtype=torch.long, device=self.dev)
         lays = [self.ccache.layers[L] for L in range(self.n_chip)]
         saved = [(lay.conv_states[0].clone(), lay.recurrent_states[0].clone()) for lay in lays]
         s = torch.cuda.Stream()
@@ -276,7 +519,7 @@ class RvChat:
         return self.g_out[0, -1].clone()
 
     @torch.no_grad()
-    def _qwen_step(self, hc, cache, pos: int):
+    def _qwen_step(self, hc, cache, pos: int, *, full_head: bool = True, project: bool = True):
         """Qwen's layers on a text token whose residual after the chip layers is hc."""
         h = hc.view(1, 1, -1)
         p4 = torch.full((4, 1, 1), pos, device=self.dev, dtype=torch.long)
@@ -284,11 +527,29 @@ class RvChat:
         for i in range(self.n_chip, len(self.lm.layers)):
             h = self.lm.layers[i](h, position_embeddings=pe, attention_mask=None,
                                   position_ids=p4[0], past_key_values=cache)
-        return self.model.lm_head(self.lm.norm(h))[0, -1]
+        # Echoes still pass through every language layer to update the cache. When
+        # the circuit owns the next token, the vocabulary projection is unnecessary.
+        return self._project(self.lm.norm(h), full_head=full_head)[0, -1] if project else None
+
+    def _project(self, h, *, full_head: bool):
+        """Project only the vocabulary rows decoding will consume."""
+        head = self.model.lm_head
+        if not full_head and type(head) is torch.nn.Linear:
+            bias = None if head.bias is None else head.bias[:self.v0]
+            return torch.nn.functional.linear(h, head.weight[:self.v0], bias)
+        logits = head(h)
+        return logits if full_head else logits[..., :self.v0]
+
+    @torch.no_grad()
+    def _prefill(self, x):
+        """Cache the whole prompt; project only its last position and text vocabulary."""
+        out = self.lm(input_ids=x, use_cache=True)
+        logits = self._project(out.last_hidden_state[:, -1:], full_head=False)[0, -1]
+        return out.past_key_values, logits
 
     # --- one position ----------------------------------------------------------------------
     @torch.no_grad()
-    def _layers(self, ids, cache, pos: int | None):
+    def _layers(self, ids, cache, pos: int | None, *, full_head: bool = True):
         """Run one token through the chip layers (pos None) or the whole stack (text at RoPE
         position pos); returns (residual after the chip layers, logits or None)."""
         h = self.lm.embed_tokens(torch.tensor([[ids]], device=self.dev))
@@ -304,12 +565,74 @@ class RvChat:
                                   position_ids=tp, past_key_values=cache)
             if i == self.n_chip - 1:
                 hc = h
-        logits = None if pos is None else self.model.lm_head(self.lm.norm(h))[0, -1]
+        logits = None if pos is None else self._project(self.lm.norm(h), full_head=full_head)[0, -1]
         return hc[0, -1], logits
 
     def circuit_token(self, hc) -> int | None:
         """The model id the circuit predicts at a position, None where Qwen predicts."""
         return self.code_token(hc[self.code_dims])
+
+    def _chip_prediction(self, hc) -> int | None:
+        if self.fast and self.graph is not None:
+            token = int(self.g_next)
+            if token == CodeDecoder.UNOWNED:
+                return None
+            if token != CodeDecoder.INVALID:
+                return token
+        return self.circuit_token(hc)
+
+    @torch.no_grad()
+    def boot(self, program, *, max_steps: int = 60000) -> FirmwareState:
+        """Execute firmware startup in the HF circuit and park at its first HALT.
+
+        Machine.from_program only initializes the program's memory/register image;
+        no reference instruction is executed. The returned heads can seed new chats.
+        """
+        if type(max_steps) is not int or max_steps < 1:
+            raise ValueError("max_steps must be a positive integer")
+        if self.executor:
+            return self._exec_boot(program, max_steps)
+        core.snapshot(self.c, ref.Machine.from_program(program))
+        prefix = torch.tensor([[self.T.NL]], device=self.dev)
+        if self.fast:
+            cache = self._chip_cache()
+            self.cm(input_ids=prefix, past_key_values=cache, use_cache=True)
+        else:
+            cache = self.lm(input_ids=prefix, use_cache=True).past_key_values
+        hf.inject(self.c, cache)
+        if self.fast and self.graph is None:
+            self._capture()
+        token, halt = self.v0 + S.tok("GO"), self.v0 + S.tok("HALT")
+        fault = self.v0 + S.tok("FLT", 0)
+        for step in range(1, max_steps + 1):
+            if fault <= token < fault + S.FAMILIES["FLT"][1]:
+                raise RuntimeError("firmware faulted during neural boot")
+            hc = (self._chip_step(token, step, cache) if self.fast
+                  else self._layers(token, cache, None)[0])
+            # Consume HALT as well: commit its pending writes and park the bridge.
+            if token == halt:
+                heads = tuple(cache.layers[i].recurrent_states[0].clone()
+                              for i in range(self.n_chip))
+                return FirmwareState(heads, step)
+            token = self._chip_prediction(hc)
+            if token is None:
+                raise RuntimeError("the circuit gave up a position during neural boot")
+        raise RuntimeError(f"firmware did not halt within {max_steps} neural boot steps")
+
+    @torch.no_grad()
+    def _exec_boot(self, program, max_steps: int) -> ExecState:
+        """boot on the executor: the same prefix, snapshot and free run to the first HALT."""
+        core.snapshot(self.c, ref.Machine.from_program(program))
+        self._exec_start([self.T.NL])
+        token, halt = self.v0 + S.tok("GO"), self.v0 + S.tok("HALT")
+        for step in range(1, max_steps + 1):
+            keep = self._exec_step(token)
+            if token == halt:
+                return self.erow.save(step)
+            token = self.code_token(keep[: len(self.code_dims)])
+            if token is None or token < self.v0:
+                raise RuntimeError("the circuit gave up a position during neural boot")
+        raise RuntimeError(f"firmware did not halt within {max_steps} neural boot steps")
 
     # --- a conversation --------------------------------------------------------------------
     def prompt_ids(self, messages, tools=(CALC_TOOL,)) -> list[int]:
@@ -321,41 +644,58 @@ class RvChat:
         return [int(x) for x in out]
 
     @torch.no_grad()
-    def generate(self, ids: list[int], machine: "ref.Machine", max_new: int = 4000,
+    def generate(self, ids: list[int], machine: "ref.Machine | FirmwareState", max_new: int = 4000,
                  max_chip: int = 60000, check_head: bool = False, verbose: bool = False,
-                 lock: "BR.Session | None" = None, on_token=None) -> dict:
+                 lock: "BR.Session | None" = None, on_token=None, stop=None,
+                 force: list[int] | None = None, until_released: bool = False) -> dict:
         """Greedy decoding after the prompt ``ids`` with the parked ``machine`` loaded.
         ``lock`` (a Session on a copy of the machine): stop at the first token that differs from
-        the reference's. ``on_token(id)`` is called with every generated model id as it comes."""
+        the reference's. ``on_token(id)`` is called with every generated model id as it comes.
+        ``force``: Qwen tokens written in place of Qwen's own choices at the first positions
+        Qwen owns (e.g. a tool call the user typed as keys); the circuit captures them as it
+        would Qwen's. ``until_released``: stop when Qwen gets a position back after a run."""
+        force = list(force or [])
+        booted = isinstance(machine, (FirmwareState, ExecState))
+        if booted and isinstance(machine, FirmwareState) == bool(self.executor):
+            raise ValueError("this firmware state belongs to the other chip path")
         x = torch.tensor([ids], device=self.dev)
-        out = self.model(input_ids=x, use_cache=True)
-        cache = out.past_key_values  # (fast: Qwen's layers only)
-        core.snapshot(self.c, machine)
+        cache, logits = self._prefill(x)  # (fast: Qwen's layers only)
+        if not booted:
+            core.snapshot(self.c, machine)
         if self.executor:
-            self._exec_start(ids)
+            self._exec_start(ids, machine if booted else None)
         if self.fast:
             ccache = self._chip_cache()
             h = self.cm.embed_tokens(x)  # the prompt through the chip layers only
             for L in range(self.n_chip):
                 h = self.cm.layers[L](h, position_embeddings=None, attention_mask=None,
                                       position_ids=None, past_key_values=ccache)
-            hf.inject(self.c, ccache)
+            if booted:
+                machine.inject(ccache)
+            else:
+                hf.inject(self.c, ccache)
             if self.graph is None:
                 self._capture()
             g = len(ids)  # the chip view's cache position (every token)
         elif not self.executor:
-            hf.inject(self.c, cache)
+            if booted:
+                machine.inject(cache)
+            else:
+                hf.inject(self.c, cache)
         n_verify_bad = 0
-        logits = out.logits[0, -1]
         pos = len(ids)  # the next text token's RoPE position
         gen, n_text, n_chip_tok = [], 0, 0
         # the prompt's last position: Qwen predicts (nothing captured yet)
-        nxt = int(torch.argmax(logits[: self.v0]))
-        t0 = time.time()
+        nxt = force.pop(0) if force else int(torch.argmax(logits[: self.v0]))
+        t0 = time.perf_counter()
         mismatch = 0
         t_chip = t_text = 0.0
+        gpu_phases = [] if torch.device(self.dev).type == "cuda" else None
         expect, lock_error = [], None
+        owned = False
         while n_text < max_new and n_chip_tok < max_chip:
+            if stop is not None and stop.is_set() and not owned:
+                break
             gen.append(nxt)
             if on_token is not None:
                 on_token(nxt)
@@ -384,13 +724,44 @@ class RvChat:
                     expect = list(lock.toks[k + 1:])
             if nxt in self.eos:
                 break
+            if (self.executor and not self.verify and lock is None and nxt >= self.v0
+                    and n_chip_tok + 1 < max_chip):
+                # a run of chip tokens: the device token loop
+                ts = time.perf_counter()
+                if gpu_phases is not None and (not gpu_phases or gpu_phases[-1][0] != "chip"):
+                    event = torch.cuda.Event(enable_timing=True)
+                    event.record(torch.cuda.current_stream(self.dev))
+                    gpu_phases.append(("chip", event))
+
+                first = [True]
+
+                def seen(block):  # nxt itself was reported above
+                    if on_token is not None:
+                        for t in block[1:] if first[0] else block:
+                            on_token(t)
+                    first[0] = False
+
+                fed, pred = self.erow.run_chip(nxt, max_chip - n_chip_tok, seen, stop)
+                gen += fed[1:]
+                n_chip_tok += len(fed)
+                t_chip += time.perf_counter() - ts
+                if pred < 0:
+                    raise RuntimeError("the circuit gave up a chip position")
+                nxt, owned = pred, True
+                continue
             if verbose and len(gen) % 500 == 0:
                 tail = [S.name(t - self.v0) if t >= self.v0 else repr(self.tok.decode([t]))
                         for t in gen[-8:]]
                 print(f"  {len(gen)} tokens ({n_text} text, {n_chip_tok} chip) "
-                      f"{time.time() - t0:.0f}s: {' '.join(tail)}", flush=True)
-            ts = time.time()
+                      f"{time.perf_counter() - t0:.0f}s: {' '.join(tail)}", flush=True)
+            ts = time.perf_counter()
             chip_in = nxt >= self.v0
+            if gpu_phases is not None:
+                phase = "chip" if chip_in else "text"
+                if not gpu_phases or gpu_phases[-1][0] != phase:
+                    event = torch.cuda.Event(enable_timing=True)
+                    event.record(torch.cuda.current_stream(self.dev))
+                    gpu_phases.append((phase, event))
             hc = keep = None
             if self.executor:
                 keep = self._exec_step(nxt)
@@ -406,30 +777,54 @@ class RvChat:
                         n_verify_bad += 1
                 hc = hf_hc
             elif not self.executor:
-                hc, logits = self._layers(nxt, cache, None if chip_in else pos)
+                hc, _ = self._layers(nxt, cache, None)
+            if hc is None:
+                ct = self.code_token(keep[:len(self.code_dims)])
+            else:
+                ct = self._chip_prediction(hc)
+            owned = ct is not None
             if chip_in:  # a chip token
                 n_chip_tok += 1
-                nxt = (self.code_token(keep[: len(self.code_dims)]) if hc is None
-                       else self.circuit_token(hc))
-                t_chip += time.time() - ts
+                nxt = ct
+                t_chip += time.perf_counter() - ts
                 if nxt is None:
                     raise RuntimeError("the circuit gave up a chip position")
             else:
                 n_text += 1
-                if self.fast or self.executor:
-                    logits = self._qwen_step(hc, cache, pos)
+                logits = self._qwen_step(hc, cache, pos, full_head=check_head,
+                                         project=ct is None or check_head)
                 pos += 1
-                ct = self.circuit_token(hc)
-                q = int(torch.argmax(logits))
-                if ct is not None and check_head and q != ct:
+                if ct is not None and check_head and int(torch.argmax(logits)) != ct:
                     mismatch += 1
-                nxt = ct if ct is not None else int(torch.argmax(logits[: self.v0]))
-                t_text += time.time() - ts
-        dt = time.time() - t0
+                t_text += time.perf_counter() - ts
+                if ct is None and force:
+                    nxt = force.pop(0)
+                elif ct is None and until_released and n_chip_tok:
+                    break
+                else:
+                    nxt = ct if ct is not None else int(torch.argmax(logits[: self.v0]))
+        if gpu_phases:
+            # Echo steps no longer force a host sync through the head's argmax.
+            # Time phase boundaries on the device, then wait once before reporting.
+            end = torch.cuda.Event(enable_timing=True)
+            end.record(torch.cuda.current_stream(self.dev))
+            end.synchronize()
+            totals = {"chip": 0.0, "text": 0.0}
+            for i, (phase, start) in enumerate(gpu_phases):
+                finish = gpu_phases[i + 1][1] if i + 1 < len(gpu_phases) else end
+                totals[phase] += start.elapsed_time(finish) / 1000
+            t_chip, t_text = totals["chip"], totals["text"]
+        dt = time.perf_counter() - t0
+        if not self.executor:
+            self.last_firmware_state = FirmwareState.capture(
+                ccache if self.fast else cache, self.n_chip, n_chip_tok)
+        else:
+            self.last_firmware_state = self.erow.save(n_chip_tok)
         return {"tokens": gen, "text_tokens": n_text, "chip_tokens": n_chip_tok,
                 "seconds": dt, "head_mismatch": mismatch, "lock_error": lock_error,
                 "verify_mismatch": n_verify_bad if self.verify else None,
-                "chip_seconds": round(t_chip, 2), "text_seconds": round(t_text, 2)}
+                "chip_seconds": round(t_chip, 2), "text_seconds": round(t_text, 2),
+                "circuit_paused": owned}
 
     def to_stream(self, ids: list[int]) -> list[int]:
         """Model ids -> the circuit's token stream (chip tokens, TEXT_TOKEN | qwen id)."""
@@ -494,22 +889,29 @@ def main() -> None:
     ap.add_argument("--firmware", default="tests/data/rv/calc-bridge.elf")
     ap.add_argument("--ask", default="Use calc: what is 123456789 * 987654321?")
     ap.add_argument("--max-new", type=int, default=600)
-    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--check", action="store_true",
+                    help="validate vocabulary predictions and run reference lockstep and replay")
     ap.add_argument("--slow", action="store_true", help="every layer through the HF modules")
     args = ap.parse_args()
     chat = RvChat(args.model, fast=not args.slow)
-    m = ref.Machine.from_program(elf.program(args.firmware))
-    BR.park(m)
-    ids = chat.prompt_ids([{"role": "user", "content": args.ask}])
-    m2 = ref.Machine.from_program(elf.program(args.firmware))
-    BR.park(m2)
-    lock = BR.Session(chat.T, m2)
-    lock.history(ids)
-    r = chat.generate(ids, m, args.max_new, check_head=True, verbose=True, lock=lock)
-    print(chat.text_of(r["tokens"]))
-    print(f"[{r['text_tokens']} text + {r['chip_tokens']} chip tokens in {r['seconds']:.1f}s, "
-          f"head mismatches {r['head_mismatch']}, lock error {r['lock_error']}]")
+    program = elf.program(args.firmware)
     if args.check:
+        m = ref.Machine.from_program(program)
+        BR.park(m)
+    else:
+        m = chat.boot(program)
+    ids = chat.prompt_ids([{"role": "user", "content": args.ask}])
+    lock = None
+    if args.check:
+        m2 = ref.Machine.from_program(elf.program(args.firmware))
+        BR.park(m2)
+        lock = BR.Session(chat.T, m2)
+        lock.history(ids)
+    r = chat.generate(ids, m, args.max_new, check_head=args.check, verbose=True, lock=lock)
+    print(chat.text_of(r["tokens"]))
+    print(f"[{r['text_tokens']} text + {r['chip_tokens']} chip tokens in {r['seconds']:.1f}s]")
+    if args.check:
+        print(f"head mismatches {r['head_mismatch']}, lock error {r['lock_error']}")
         print(replay(chat, ids, r["tokens"], args.firmware))
 
 

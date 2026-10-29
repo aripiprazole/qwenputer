@@ -414,6 +414,7 @@ class Machine:
         return cls(rom, ram, x, (e - S.ROM_BASE) >> 2, drom=bytes(rodata))
 
     out: bytearray = field(default_factory=bytearray)  # putchar output
+    screen: bytearray = field(default_factory=bytearray)  # display output (DSP)
     fault: tuple[int, int] | None = None  # (cause, pc) of the fault that halted the run
     exit_code: int | None = None
 
@@ -523,6 +524,10 @@ class Machine:
                     self.out.append(b & 0xFF)
                 self.n += 1
                 return [S.tok("BYTE", b & 0x1FF)]
+            if a == 2 and "DSP" in S.FAMILIES:  # display(a0): a byte for the terminal only
+                self.screen.append(b & 0xFF)
+                self.n += 1
+                return [S.tok("DSP", b & 0xFF)]
             if a == 93:  # exit(a0)
                 self.halted, self.exit_code = True, b
                 self.n += 1

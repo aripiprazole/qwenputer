@@ -37,6 +37,7 @@ Records:
   SB, SH                                                         V V V SS0 / SS1 (merged word)
   ECALL a7 = 1 (putchar a0)                                      BYTE
   ECALL a7 = 93 (exit)                                           HALT
+  ECALL a7 = 2 (display a0; "doom" map only)                     DSP
   a fault                                                        FLT(cause) HEX x 8 HALT
   before the instruction, when n == 63                           R
 
@@ -55,9 +56,16 @@ q_k are the hex digits of |A| / |B| (most significant first); k0 skips digits th
 be 0 from the operands' sizes (see ref.div_start), so small quotients take few tokens.
 """
 
+import os
+
 FAMILY_SIZES = [("V", 1 << 15), ("F0", 1 << 15), ("F1", 1 << 15), ("F2", 4), ("J", 1 << 16),
                 ("R", 1 << 16), ("BYTE", 512), ("FLT", 8), ("HEX", 16), ("QS", 16), ("QD", 128),
                 ("BD", 256)]
+MAP = os.environ.get("QWENPUTER_RV_MAP", "p2")
+if MAP == "doom":
+    # DSP: final; a display byte (ecall a7 = 2, a0 & 255). A chip token the host shows on the
+    # terminal and Qwen never reads, so a game frame does not enter the conversation.
+    FAMILY_SIZES.append(("DSP", 256))
 FAMILIES = {}
 _base = 0
 for _n, _s in FAMILY_SIZES:
@@ -68,21 +76,34 @@ CONTROL_NAMES = ["NT", "ST0", "ST1", "SS0", "SS1", "HALT", "GO", "SC"]
 CONTROLS = {n: CTRL + i for i, n in enumerate(CONTROL_NAMES)}
 VOCAB = CTRL + len(CONTROL_NAMES)
 FINAL = {"F0", "F1", "F2", "J", "R", "BYTE", "NT", "ST0", "ST1", "SS0", "SS1", "HALT"}
+FINAL |= {"DSP"} if "DSP" in FAMILIES else set()
 PAYLOAD_BITS = {n: (s - 1).bit_length() for n, s in FAMILY_SIZES}
 
 FAULTS = ["illegal", "ebreak", "misaligned load", "misaligned store", "load out of range",
           "store out of range", "bad jump", "ecall"]
 
-ROM_BASE, ROM_WORDS = 0x40000, 1 << 16  # 256 KB of code (two sublayers)
-DROM_BASE, DROM_WORDS = 0x20000, 1 << 15  # 128 KB of read-only data (one sublayer)
-RAM_BASE, RAM_WORDS = 0x0, 1 << 13  # 32 KB (two sublayers)
+# The address map. "p2" is the published machine. "doom" (QWENPUTER_RV_MAP=doom) widens RAM to
+# 1 MB and the DROM to 4 MB for the Doom firmware (env/doom); every region stays a power-of-two
+# block at a power-of-two base, so the circuit decodes it from address bits alone.
+if MAP == "doom":
+    ROM_BASE, ROM_WORDS = 1 << 25, 1 << 16  # 256 KB of code
+    DROM_BASE, DROM_WORDS = 1 << 24, 1 << 20  # 4 MB of read-only data (rodata, then the WAD)
+    RAM_BASE, RAM_WORDS = 0x0, 1 << 18  # 1 MB
+    TEXT_ADDR = 1 << 23
+elif MAP == "p2":
+    ROM_BASE, ROM_WORDS = 0x40000, 1 << 16  # 256 KB of code (two sublayers)
+    DROM_BASE, DROM_WORDS = 0x20000, 1 << 15  # 128 KB of read-only data (one sublayer)
+    RAM_BASE, RAM_WORDS = 0x0, 1 << 13  # 32 KB (two sublayers)
+    TEXT_ADDR = 0x8000
+else:
+    raise ValueError(f"unknown QWENPUTER_RV_MAP {MAP!r}")
 DATA_BASE = 0x100  # .data starts here (address 0 stays a null pointer)
 SP_INIT = RAM_BASE + 4 * RAM_WORDS
 N_MAX = 63  # the R refresh comes before the instruction when n == N_MAX
 MISA = 0x40001100  # RV32, I and M
 # (P3) the text buffer, loads only: row i (1..CAP_MAX) holds the i-th token of the latest tool
 # call's text, its UTF-8 bytes NUL-padded to TEXT_ROW, at TEXT_ADDR + TEXT_ROW * i
-TEXT_ADDR, TEXT_ROW, TEXT_ROWS = 0x8000, 16, 128
+TEXT_ROW, TEXT_ROWS = 16, 128
 # the capture counter's thermometer weights are 8 * 2^m: m < 88 keeps them below bf16's max
 # after the emitter's 2^36 fold
 CAP_MAX = 80

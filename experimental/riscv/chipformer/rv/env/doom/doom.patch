@@ -1,0 +1,929 @@
+diff --color -ruN a/src/d_main.c b/src/d_main.c
+--- a/src/d_main.c	2026-10-29 05:20:35
++++ b/src/d_main.c	2026-10-29 14:08:28
+@@ -194,6 +194,11 @@
+ extern  int             showMessages;
+ void R_ExecuteSetViewSize (void);
+ 
++// Qwenputer (qdoom.c): only the 3D view is shown this frame, so the status bar, the heads-up
++// text and the view border are not drawn (their palette effects still apply).
++extern boolean q_viewonly;
++void ST_PaletteOnly (void);
++
+ void D_Display (void)
+ {
+     static  boolean             viewactivestate = false;
+@@ -202,6 +207,7 @@
+     static  boolean             fullscreen = false;
+     static  gamestate_t         oldgamestate = -1;
+     static  int                 borderdrawcount;
++    static  boolean             sbarhidden = false;
+     int                         nowtime;
+     int                         tics;
+     int                         wipestart;
+@@ -232,7 +238,7 @@
+     else
+         wipe = false;
+ 
+-    if (gamestate == GS_LEVEL && gametic)
++    if (gamestate == GS_LEVEL && gametic && !q_viewonly)
+         HU_Erase();
+ 
+     // do buffered drawing
+@@ -247,6 +253,15 @@
+             redrawsbar = true;
+         if (inhelpscreensstate && !inhelpscreens)
+             redrawsbar = true;              // just put away the help screen
++        if (q_viewonly)
++        {
++            ST_PaletteOnly ();
++            sbarhidden = true;
++            break;
++        }
++        if (sbarhidden)
++            redrawsbar = true;              // shown again: draw all of it
++        sbarhidden = false;
+         ST_Drawer (viewheight == 200, redrawsbar );
+         fullscreen = viewheight == 200;
+         break;
+@@ -271,7 +286,7 @@
+     if (gamestate == GS_LEVEL && !automapactive && gametic)
+         R_RenderPlayerView (&players[displayplayer]);
+ 
+-    if (gamestate == GS_LEVEL && gametic)
++    if (gamestate == GS_LEVEL && gametic && !q_viewonly)
+         HU_Drawer ();
+ 
+     // clean up border stuff
+@@ -290,7 +305,7 @@
+     {
+         if (menuactive || menuactivestate || !viewactivestate)
+             borderdrawcount = 3;
+-        if (borderdrawcount)
++        if (borderdrawcount && !q_viewonly)
+         {
+             R_DrawViewBorder ();    // erase old menu stuff
+             borderdrawcount--;
+@@ -355,7 +370,8 @@
+ //
+ extern  boolean         demorecording;
+ 
+-void D_DoomLoop (void)
++// Qwenputer: the game loop is in qdoom.c (one call per tool call).
++void D_DoomLoop_vanilla (void)
+ {
+     if (demorecording)
+         G_BeginRecording ();
+@@ -568,165 +584,10 @@
+ //
+ void IdentifyVersion (void)
+ {
+-
+-    char*       doom1wad;
+-    char*       doomwad;
+-    char*       doomuwad;
+-    char*       doom2wad;
+-
+-    char*       doom2fwad;
+-    char*       plutoniawad;
+-    char*       tntwad;
+-
+-#ifdef NORMALUNIX
+-    char *home;
+-    char *doomwaddir;
+-    doomwaddir = getenv("DOOMWADDIR");
+-    if (!doomwaddir) {
+-        doom2wad    = "doom2.wad";     // Commercial
+-        doomuwad    = "doomu.wad";     // Retail
+-        doomwad     = "doom.wad";      // Registered
+-        doom1wad    = "doom1.wad";     // Shareware
+-        plutoniawad = "plutonia.wad";
+-        tntwad      = "tnt.wad";
+-        doom2fwad   = "doom2f.wad";    // French
+-    } else {
+-        // Commercial.
+-        doom2wad = malloc(strlen(doomwaddir)+1+9+1);
+-        sprintf(doom2wad, "%s/doom2.wad", doomwaddir);
+-
+-        // Retail.
+-        doomuwad = malloc(strlen(doomwaddir)+1+8+1);
+-        sprintf(doomuwad, "%s/doomu.wad", doomwaddir);
+-
+-        // Registered.
+-        doomwad = malloc(strlen(doomwaddir)+1+8+1);
+-        sprintf(doomwad, "%s/doom.wad", doomwaddir);
+-
+-        // Shareware.
+-        doom1wad = malloc(strlen(doomwaddir)+1+9+1);
+-        sprintf(doom1wad, "%s/doom1.wad", doomwaddir);
+-
+-         // Bug, dear Shawn.
+-        // Insufficient malloc, caused spurious realloc errors.
+-        plutoniawad = malloc(strlen(doomwaddir)+1+/*9*/12+1);
+-        sprintf(plutoniawad, "%s/plutonia.wad", doomwaddir);
+-
+-        tntwad = malloc(strlen(doomwaddir)+1+9+1);
+-        sprintf(tntwad, "%s/tnt.wad", doomwaddir);
+-
+-        // French stuff.
+-        doom2fwad = malloc(strlen(doomwaddir)+1+10+1);
+-        sprintf(doom2fwad, "%s/doom2f.wad", doomwaddir);
+-    }
+-
+-    home = getenv("HOME");
+-    if (home)
+-        sprintf(basedefault, "%s/.doomrc", home);
+-    else
+-        sprintf(basedefault, "doomrc");
+-#endif
+-
+-    if (M_CheckParm ("-shdev"))
+-    {
+-        gamemode = shareware;
+-        devparm = true;
+-        D_AddFile (DEVDATA"doom1.wad");
+-        D_AddFile (DEVMAPS"data_se/texture1.lmp");
+-        D_AddFile (DEVMAPS"data_se/pnames.lmp");
+-        strcpy (basedefault,DEVDATA"default.cfg");
+-        return;
+-    }
+-
+-    if (M_CheckParm ("-regdev"))
+-    {
+-        gamemode = registered;
+-        devparm = true;
+-        D_AddFile (DEVDATA"doom.wad");
+-        D_AddFile (DEVMAPS"data_se/texture1.lmp");
+-        D_AddFile (DEVMAPS"data_se/texture2.lmp");
+-        D_AddFile (DEVMAPS"data_se/pnames.lmp");
+-        strcpy (basedefault,DEVDATA"default.cfg");
+-        return;
+-    }
+-
+-    if (M_CheckParm ("-comdev"))
+-    {
+-        gamemode = commercial;
+-        devparm = true;
+-        /* I don't bother
+-        if(plutonia)
+-            D_AddFile (DEVDATA"plutonia.wad");
+-        else if(tnt)
+-            D_AddFile (DEVDATA"tnt.wad");
+-        else*/
+-            D_AddFile (DEVDATA"doom2.wad");
+-
+-        D_AddFile (DEVMAPS"cdata/texture1.lmp");
+-        D_AddFile (DEVMAPS"cdata/pnames.lmp");
+-        strcpy (basedefault,DEVDATA"default.cfg");
+-        return;
+-    }
+-
+-    if ( !access (doom2fwad,R_OK) )
+-    {
+-        gamemode = commercial;
+-        // C'est ridicule!
+-        // Let's handle languages in config files, okay?
+-        language = french;
+-        printf("French version\n");
+-        D_AddFile (doom2fwad);
+-        return;
+-    }
+-
+-    if ( !access (doom2wad,R_OK) )
+-    {
+-        gamemode = commercial;
+-        D_AddFile (doom2wad);
+-        return;
+-    }
+-
+-    if ( !access (plutoniawad, R_OK ) )
+-    {
+-      gamemode = commercial;
+-      D_AddFile (plutoniawad);
+-      return;
+-    }
+-
+-    if ( !access ( tntwad, R_OK ) )
+-    {
+-      gamemode = commercial;
+-      D_AddFile (tntwad);
+-      return;
+-    }
+-
+-    if ( !access (doomuwad,R_OK) )
+-    {
+-      gamemode = retail;
+-      D_AddFile (doomuwad);
+-      return;
+-    }
+-
+-    if ( !access (doomwad,R_OK) )
+-    {
+-      gamemode = registered;
+-      D_AddFile (doomwad);
+-      return;
+-    }
+-
+-    if ( !access (doom1wad,R_OK) )
+-    {
+-      gamemode = shareware;
+-      D_AddFile (doom1wad);
+-      return;
+-    }
+-
+-    printf("Game mode indeterminate.\n");
+-    gamemode = indetermined;
+-
+-    // We don't abort. Let's see what the PWAD contains.
+-    //exit(1);
+-    //I_Error ("Game mode indeterminate\n");
++    // Qwenputer: the shareware IWAD lives in the DROM (qlibc's only file).
++    gamemode = shareware;
++    D_AddFile ("doom1.wad");
++    strcpy (basedefault, "doomrc");
+ }
+ 
+ //
+diff --color -ruN a/src/m_fixed.c b/src/m_fixed.c
+--- a/src/m_fixed.c	2026-10-29 05:20:35
++++ b/src/m_fixed.c	2026-10-29 14:12:34
+@@ -73,9 +73,12 @@
+   fixed_t       b )
+ {
+ #if 1
+-    long long c;
+-    c = ((long long)a<<16) / ((long long)b);
+-    return (fixed_t) c;
++    // Qwenputer: (a << 16) / b as one 64/32 division in 32-bit steps (qlibc's q_divlu);
++    // FixedDiv guarantees the quotient fits.
++    unsigned ua = a < 0 ? 0u - a : a, ub = b < 0 ? 0u - b : b;
++    // |a| < 2^16: a << 16 fits 32 bits and one divu gives the same quotient
++    unsigned q = ua >> 16 ? q_divlu (ua >> 16, ua << 16, ub) : (ua << 16) / ub;
++    return (a ^ b) < 0 ? -(fixed_t) q : (fixed_t) q;
+ #else
+     double c;
+ 
+diff --color -ruN a/src/p_setup.c b/src/p_setup.c
+--- a/src/p_setup.c	2026-10-29 05:20:35
++++ b/src/p_setup.c	2026-10-29 14:13:24
+@@ -476,8 +476,7 @@
+     blockmap = blockmaplump+4;
+     count = W_LumpLength (lump)/2;
+ 
+-    for (i=0 ; i<count ; i++)
+-        blockmaplump[i] = SHORT(blockmaplump[i]);
++    // Qwenputer: the lump is read in place (read-only); SHORT is the identity on RV32.
+ 
+     bmaporgx = blockmaplump[0]<<FRACBITS;
+     bmaporgy = blockmaplump[1]<<FRACBITS;
+@@ -534,24 +533,34 @@
+     }
+ 
+     // build line tables for each sector
++    // Qwenputer: one pass over the lines (not one per sector), each sector's lines in line
++    // order as before; linecount counts them in again. The box is then built in that order
++    // (M_AddToBox depends on it).
+     linebuffer = Z_Malloc (total*4, PU_LEVEL, 0);
+     sector = sectors;
+     for (i=0 ; i<numsectors ; i++, sector++)
+     {
+-        M_ClearBox (bbox);
+         sector->lines = linebuffer;
+-        li = lines;
+-        for (j=0 ; j<numlines ; j++, li++)
++        linebuffer += sector->linecount;
++        sector->linecount = 0;
++    }
++    li = lines;
++    for (j=0 ; j<numlines ; j++, li++)
++    {
++        li->frontsector->lines[li->frontsector->linecount++] = li;
++        if (li->backsector && li->backsector != li->frontsector)
++            li->backsector->lines[li->backsector->linecount++] = li;
++    }
++    sector = sectors;
++    for (i=0 ; i<numsectors ; i++, sector++)
++    {
++        M_ClearBox (bbox);
++        for (j=0 ; j<sector->linecount ; j++)
+         {
+-            if (li->frontsector == sector || li->backsector == sector)
+-            {
+-                *linebuffer++ = li;
+-                M_AddToBox (bbox, li->v1->x, li->v1->y);
+-                M_AddToBox (bbox, li->v2->x, li->v2->y);
+-            }
++            li = sector->lines[j];
++            M_AddToBox (bbox, li->v1->x, li->v1->y);
++            M_AddToBox (bbox, li->v2->x, li->v2->y);
+         }
+-        if (linebuffer - sector->lines != sector->linecount)
+-            I_Error ("P_GroupLines: miscounted");
+ 
+         // set the degenmobj_t to the middle of the bounding box
+         sector->soundorg.x = (bbox[BOXRIGHT]+bbox[BOXLEFT])/2;
+diff --color -ruN a/src/r_data.c b/src/r_data.c
+--- a/src/r_data.c	2026-10-29 05:20:35
++++ b/src/r_data.c	2026-10-29 14:13:40
+@@ -72,7 +72,7 @@
+     short       patch;
+     short       stepdir;
+     short       colormap;
+-} mappatch_t;
++} __attribute__((packed, aligned(2))) mappatch_t;  // Qwenputer: read in place, 2-aligned
+ 
+ 
+ //
+@@ -89,7 +89,7 @@
+     void                **columndirectory;      // OBSOLETE
+     short               patchcount;
+     mappatch_t  patches[1];
+-} maptexture_t;
++} __attribute__((packed, aligned(2))) maptexture_t;
+ 
+ 
+ // A single patch from a texture definition,
+@@ -384,6 +384,8 @@
+     int         ofs;
+ 
+     col &= texturewidthmask[tex];
++    if (texturecompositesize[tex] < 0)
++        R_GenerateLookup (tex);
+     lump = texturecolumnlump[tex][col];
+     ofs = texturecolumnofs[tex][col];
+ 
+@@ -399,6 +401,39 @@
+ 
+ 
+ 
++// Qwenputer: a hash of the texture names (case-insensitive, at most 8 characters, as the
++// strncasecmp of the lookup), its chains in increasing order: the first match is the lowest
++// index, as the linear scan found.
++#define TEXTUREHASH 512
++static short texturehash[TEXTUREHASH];
++static short* texturenext;
++
++static unsigned R_HashTextureName (const char* name)
++{
++    unsigned h = 0;
++    int i;
++
++    for (i = 0; i < 8 && name[i]; i++)
++        h = h * 31 + toupper (name[i]);
++    return (h * 0x9E3779B1u) >> 23;
++}
++
++static void R_HashTextures (void)
++{
++    int i;
++
++    texturenext = Z_Malloc (numtextures * sizeof(*texturenext), PU_STATIC, 0);
++    for (i = 0; i < TEXTUREHASH; i++)
++        texturehash[i] = -1;
++    for (i = numtextures - 1; i >= 0; i--)
++    {
++        unsigned h = R_HashTextureName (textures[i]->name);
++        texturenext[i] = texturehash[h];
++        texturehash[h] = i;
++    }
++}
++
++
+ //
+ // R_InitTextures
+ // Initializes the texture list
+@@ -558,15 +593,18 @@
+     if (maptex2)
+         Z_Free (maptex2);
+ 
+-    // Precalculate whatever possible.
++    // Qwenputer: each texture's lookup is made when R_GetColumn first needs it (a level uses
++    // few of them); a size of -1 marks one not made yet.
+     for (i=0 ; i<numtextures ; i++)
+-        R_GenerateLookup (i);
++        texturecompositesize[i] = -1;
+ 
+     // Create translation table for global animation.
+     texturetranslation = Z_Malloc ((numtextures+1)*4, PU_STATIC, 0);
+ 
+     for (i=0 ; i<numtextures ; i++)
+         texturetranslation[i] = i;
++
++    R_HashTextures ();
+ }
+ 
+ 
+@@ -697,7 +735,7 @@
+     if (name[0] == '-')
+         return 0;
+ 
+-    for (i=0 ; i<numtextures ; i++)
++    for (i = texturehash[R_HashTextureName (name)]; i >= 0; i = texturenext[i])
+         if (!strncasecmp (textures[i]->name, name, 8) )
+             return i;
+ 
+diff --color -ruN a/src/r_draw.c b/src/r_draw.c
+--- a/src/r_draw.c	2026-10-29 05:20:35
++++ b/src/r_draw.c	2026-10-29 14:15:49
+@@ -145,18 +145,19 @@
+ 
+ 
+ 
++// Qwenputer: the view rows the text frame samples. qnextrow[y] is the first sampled row at or
++// below y (SCREENHEIGHT if none); qdoom.c sets it before each frame (every row when the whole
++// screen is shown).
++short qnextrow[SCREENHEIGHT + 1];
++
+ void R_DrawColumnLow (void)
+ {
+-    int                 count;
++    int                 y;
+     byte*               dest;
+-    byte*               dest2;
+-    fixed_t             frac;
+     fixed_t             fracstep;
+ 
+-    count = dc_yh - dc_yl;
+-
+     // Zero length.
+-    if (count < 0)
++    if (dc_yh < dc_yl)
+         return;
+ 
+ #ifdef RANGECHECK
+@@ -172,21 +173,18 @@
+     // Blocky mode, need to multiply by 2.
+     dc_x <<= 1;
+ 
+-    dest = screens[0] + (viewwindowy + dc_yl) * SCREENWIDTH + (viewwindowx + dc_x);
+-    dest2 = dest + 1;
+-
+     fracstep = dc_iscale;
+-    frac = dc_texturemid + (dc_yl-centery)*fracstep;
+ 
+-    do
++    // Only the sampled rows; a row's frac is the one the original loop reaches there,
++    // dc_texturemid + (y-centery)*fracstep (it stepped by fracstep from dc_yl).
++    for (y = qnextrow[dc_yl]; y <= dc_yh; y = qnextrow[y + 1])
+     {
+-        // Hack. Does not work corretly.
+-        *dest2 = *dest = dc_colormap[dc_source[(frac>>FRACBITS)&127]];
+-        dest += SCREENWIDTH;
+-        dest2 += SCREENWIDTH;
+-        frac += fracstep;
++        fixed_t frac = dc_texturemid + (y-centery)*fracstep;
+ 
+-    } while (count--);
++        dest = screens[0] + (viewwindowy + y) * SCREENWIDTH + (viewwindowx + dc_x);
++        // Hack. Does not work corretly. (Both bytes in one halfword store; dest is even.)
++        *(unsigned short *)dest = dc_colormap[dc_source[(frac>>FRACBITS)&127]] * 0x0101;
++    }
+ }
+ 
+ 
+@@ -540,8 +538,10 @@
+         spot = ((yfrac>>(16-6))&(63*64)) + ((xfrac>>16)&63);
+         // Lowres/blocky mode does it twice,
+         //  while scale is adjusted appropriately.
+-        *dest++ = ds_colormap[ds_source[spot]];
+-        *dest++ = ds_colormap[ds_source[spot]];
++        // Qwenputer: both bytes in one halfword store (dest is even: the view's left edge
++        // and the doubled x are), one circuit record instead of two
++        *(unsigned short *)dest = ds_colormap[ds_source[spot]] * 0x0101;
++        dest += 2;
+ 
+         xfrac += ds_xstep;
+         yfrac += ds_ystep;
+@@ -595,6 +595,10 @@
+ 
+     // DOOM II border patch.
+     char        name2[] = "GRNROCK";
++
++    // Qwenputer: no border. screens[1] is screens[0] (one screen), and the text frame shows
++    // only the view window.
++    return;
+ 
+     char*       name;
+ 
+diff --color -ruN a/src/r_draw.h b/src/r_draw.h
+--- a/src/r_draw.h	2026-10-29 05:20:35
++++ b/src/r_draw.h	2026-10-29 14:08:15
+@@ -46,6 +46,7 @@
+ //  here.
+ void    R_DrawColumn (void);
+ void    R_DrawColumnLow (void);
++extern short qnextrow[];  // Qwenputer: the sampled view rows (r_draw.c)
+ 
+ // The Spectre/Invisibility effect.
+ void    R_DrawFuzzColumn (void);
+diff --color -ruN a/src/r_main.c b/src/r_main.c
+--- a/src/r_main.c	2026-10-29 05:20:35
++++ b/src/r_main.c	2026-10-29 14:13:02
+@@ -110,7 +110,7 @@
+ // fixed_t              finetangent[FINEANGLES/2];
+ 
+ // fixed_t              finesine[5*FINEANGLES/4];
+-fixed_t*                finecosine = &finesine[FINEANGLES/4];
++const fixed_t*          finecosine = &finesine[FINEANGLES/4];
+ 
+ 
+ lighttable_t*           scalelight[LIGHTLEVELS][MAXLIGHTSCALE];
+@@ -579,9 +579,11 @@
+     // Scan viewangletox[] to generate xtoviewangle[]:
+     //  xtoviewangle will give the smallest view angle
+     //  that maps to x.
+-    for (x=0;x<=viewwidth;x++)
++    // Qwenputer: one scan for all x, from the right: every i before x's answer has
++    // viewangletox[i] > x, so also > x-1, and x-1's scan can start at x's answer.
++    i = 0;
++    for (x=viewwidth;x>=0;x--)
+     {
+-        i = 0;
+         while (viewangletox[i]>x)
+             i++;
+         xtoviewangle[x] = (i<<ANGLETOFINESHIFT)-ANG90;
+@@ -590,9 +592,6 @@
+     // Take out the fencepost cases from viewangletox.
+     for (i=0 ; i<FINEANGLES/2 ; i++)
+     {
+-        t = FixedMul (finetangent[i], focallength);
+-        t = centerx - t;
+-
+         if (viewangletox[i] == -1)
+             viewangletox[i] = 0;
+         else if (viewangletox[i] == viewwidth+1)
+diff --color -ruN a/src/r_plane.c b/src/r_plane.c
+--- a/src/r_plane.c	2026-10-29 05:20:35
++++ b/src/r_plane.c	2026-10-29 14:08:15
+@@ -129,6 +129,9 @@
+     fixed_t     length;
+     unsigned    index;
+ 
++    if (qnextrow[y] != y)
++        return;  // Qwenputer: a row the text frame does not sample
++
+ #ifdef RANGECHECK
+     if (x2 < x1
+         || x1<0
+diff --color -ruN a/src/r_things.c b/src/r_things.c
+--- a/src/r_things.c	2026-10-29 05:20:35
++++ b/src/r_things.c	2026-10-29 14:07:41
+@@ -185,6 +185,8 @@
+     int         start;
+     int         end;
+     int         patched;
++    short*      sprhead;
++    short*      sprnext;
+ 
+     // count the number of sprite names
+     check = namelist;
+@@ -201,6 +203,43 @@
+     start = firstspritelump-1;
+     end = lastspritelump+1;
+ 
++    // Qwenputer: one pass over the sprite lumps instead of one per sprite name: each sprite's
++    // lumps chained in increasing order (the order of the scan below). A hash of the names
++    // finds a lump's sprite.
++    {
++        short   namehash[256];
++        short*  namenext = Z_Malloc (numsprites * sizeof(short), PU_STATIC, 0);
++
++        sprhead = Z_Malloc (numsprites * sizeof(short), PU_STATIC, 0);
++        sprnext = Z_Malloc ((end - start) * sizeof(short), PU_STATIC, 0);
++        for (i = 0; i < 256; i++)
++            namehash[i] = -1;
++        for (i = numsprites - 1; i >= 0; i--)
++        {
++            memcpy (&intname, namelist[i], 4);
++            namenext[i] = namehash[((unsigned)intname * 0x9E3779B1u) >> 24];
++            namehash[((unsigned)intname * 0x9E3779B1u) >> 24] = i;
++            sprhead[i] = -1;
++        }
++        for (l = end - 1; l > start; l--)
++        {
++            int v = *(int *)lumpinfo[l].name;
++            int s;
++
++            for (s = namehash[((unsigned)v * 0x9E3779B1u) >> 24]; s >= 0; s = namenext[s])
++            {
++                memcpy (&intname, namelist[s], 4);
++                if (intname == v)
++                {
++                    sprnext[l - start] = sprhead[s];
++                    sprhead[s] = l;
++                    break;
++                }
++            }
++        }
++        Z_Free (namenext);
++    }
++
+     // scan all the lump names for each of the names,
+     //  noting the highest frame letter.
+     // Just compare 4 characters as ints
+@@ -210,13 +249,12 @@
+         memset (sprtemp,-1, sizeof(sprtemp));
+ 
+         maxframe = -1;
+-        intname = *(int *)namelist[i];
++        memcpy (&intname, namelist[i], 4);  // Qwenputer: the name may be unaligned
+ 
+         // scan the lumps,
+         //  filling in the frames for whatever is found
+-        for (l=start+1 ; l<end ; l++)
++        for (l = sprhead[i]; l >= 0; l = sprnext[l - start])
+         {
+-            if (*(int *)lumpinfo[l].name == intname)
+             {
+                 frame = lumpinfo[l].name[4] - 'A';
+                 rotation = lumpinfo[l].name[5] - '0';
+@@ -278,6 +316,8 @@
+         memcpy (sprites[i].spriteframes, sprtemp, maxframe*sizeof(spriteframe_t));
+     }
+ 
++    Z_Free (sprnext);
++    Z_Free (sprhead);
+ }
+ 
+ 
+diff --color -ruN a/src/st_stuff.c b/src/st_stuff.c
+--- a/src/st_stuff.c	2026-10-29 05:20:35
++++ b/src/st_stuff.c	2026-10-29 14:08:28
+@@ -1106,6 +1106,12 @@
+     ST_drawWidgets(false);
+ }
+ 
++// Qwenputer: ST_Drawer's palette shifts alone (the bar is not shown this frame).
++void ST_PaletteOnly (void)
++{
++    ST_doPaletteStuff();
++}
++
+ void ST_Drawer (boolean fullscreen, boolean refresh)
+ {
+ 
+diff --color -ruN a/src/tables.c b/src/tables.c
+--- a/src/tables.c	2026-10-29 05:20:35
++++ b/src/tables.c	2026-10-29 05:20:35
+@@ -63,7 +63,7 @@
+ 
+ 
+ 
+-int finetangent[4096] =
++const int finetangent[4096] =
+ {
+     -170910304,-56965752,-34178904,-24413316,-18988036,-15535599,-13145455,-11392683,
+     -10052327,-8994149,-8137527,-7429880,-6835455,-6329090,-5892567,-5512368,
+@@ -580,7 +580,7 @@
+ };
+ 
+ 
+-int finesine[10240] =
++const int finesine[10240] =
+ {
+     25,75,125,175,226,276,326,376,
+     427,477,527,578,628,678,728,779,
+@@ -1866,7 +1866,7 @@
+ 
+ 
+ 
+-angle_t tantoangle[2049] =
++const angle_t tantoangle[2049] =
+ {
+     0,333772,667544,1001315,1335086,1668857,2002626,2336395,
+     2670163,3003929,3337694,3671457,4005219,4338979,4672736,5006492,
+diff --color -ruN a/src/tables.h b/src/tables.h
+--- a/src/tables.h	2026-10-29 05:20:35
++++ b/src/tables.h	2026-10-29 05:20:35
+@@ -56,14 +56,14 @@
+ #define ANGLETOFINESHIFT        19
+ 
+ // Effective size is 10240.
+-extern  fixed_t         finesine[5*FINEANGLES/4];
++extern  const fixed_t   finesine[5*FINEANGLES/4];
+ 
+ // Re-use data, is just PI/2 pahse shift.
+-extern  fixed_t*        finecosine;
++extern  const fixed_t*  finecosine;
+ 
+ 
+ // Effective size is 4096.
+-extern fixed_t          finetangent[FINEANGLES/2];
++extern const fixed_t    finetangent[FINEANGLES/2];
+ 
+ // Binary Angle Measument, BAM.
+ #define ANG45                   0x20000000
+@@ -82,7 +82,7 @@
+ // Effective size is 2049;
+ // The +1 size is to handle the case when x==y
+ //  without additional checking.
+-extern angle_t          tantoangle[SLOPERANGE+1];
++extern const angle_t    tantoangle[SLOPERANGE+1];
+ 
+ 
+ // Utility function,
+diff --color -ruN a/src/v_video.c b/src/v_video.c
+--- a/src/v_video.c	2026-10-29 05:20:35
++++ b/src/v_video.c	2026-10-29 05:20:35
+@@ -486,8 +486,9 @@
+ 
+     // stick these in low dos memory on PCs
+ 
+-    base = I_AllocLow (SCREENWIDTH*SCREENHEIGHT*4);
++    // Qwenputer: one screen. Screens 1-3 only hold the melt wipe, which qdoom.c turns off.
++    base = I_AllocLow (SCREENWIDTH*SCREENHEIGHT);
+ 
+     for (i=0 ; i<4 ; i++)
+-        screens[i] = base + i*SCREENWIDTH*SCREENHEIGHT;
++        screens[i] = base;
+ }
+diff --color -ruN a/src/w_wad.c b/src/w_wad.c
+--- a/src/w_wad.c	2026-10-29 05:20:35
++++ b/src/w_wad.c	2026-10-29 14:06:50
+@@ -47,6 +47,7 @@
+ #pragma implementation "w_wad.h"
+ #endif
+ #include "w_wad.h"
++#include "qlibc.h"
+ 
+ 
+ 
+@@ -291,6 +292,8 @@
+ // The name searcher looks backwards, so a later file
+ //  does override all earlier ones.
+ //
++static void W_BuildHash (void);
++
+ void W_InitMultipleFiles (char** filenames)
+ {
+     int         size;
+@@ -307,6 +310,8 @@
+     if (!numlumps)
+         I_Error ("W_InitFiles: no files found");
+ 
++    W_BuildHash ();
++
+     // set up caching
+     size = numlumps * sizeof(*lumpcache);
+     lumpcache = malloc (size);
+@@ -350,6 +355,33 @@
+ // Returns -1 if name not found.
+ //
+ 
++// Qwenputer: a hash of the (upper-case) lump names, built once all files are added. Each
++// chain lists its lumps from the last one added, so the first match is the one the backward
++// scan found ("patch lump files take precedence").
++#define LUMPHASH 2048
++static short lumphash[LUMPHASH];
++static short* lumpnext;
++
++static unsigned W_HashName (int v1, int v2)
++{
++    return ((unsigned)v1 * 0x9E3779B1u ^ (unsigned)v2 * 0x85EBCA6Bu) >> 21;
++}
++
++static void W_BuildHash (void)
++{
++    int i;
++
++    lumpnext = malloc (numlumps * sizeof(*lumpnext));
++    for (i = 0; i < LUMPHASH; i++)
++        lumphash[i] = -1;
++    for (i = 0; i < numlumps; i++)
++    {
++        unsigned h = W_HashName (*(int *)lumpinfo[i].name, *(int *)&lumpinfo[i].name[4]);
++        lumpnext[i] = lumphash[h];
++        lumphash[h] = i;
++    }
++}
++
+ int W_CheckNumForName (char* name)
+ {
+     union {
+@@ -360,7 +392,7 @@
+ 
+     int         v1;
+     int         v2;
+-    lumpinfo_t* lump_p;
++    int         i;
+ 
+     // make the name into two integers for easy compares
+     strncpy (name8.s,name,8);
+@@ -374,16 +406,12 @@
+     v1 = name8.x[0];
+     v2 = name8.x[1];
+ 
+-
+-    // scan backwards so patch lump files take precedence
+-    lump_p = lumpinfo + numlumps;
+-
+-    while (lump_p-- != lumpinfo)
++    for (i = lumphash[W_HashName (v1, v2)]; i >= 0; i = lumpnext[i])
+     {
+-        if ( *(int *)lump_p->name == v1
+-             && *(int *)&lump_p->name[4] == v2)
++        if ( *(int *)lumpinfo[i].name == v1
++             && *(int *)&lumpinfo[i].name[4] == v2)
+         {
+-            return lump_p - lumpinfo;
++            return i;
+         }
+     }
+ 
+@@ -482,7 +510,12 @@
+     if ((unsigned)lump >= numlumps)
+         I_Error ("W_CacheLumpNum: %i >= numlumps",lump);
+ 
++    // Qwenputer: the WAD is mapped read-only in the DROM; a lump is used in place.
+     if (!lumpcache[lump])
++        lumpcache[lump] = (void *)(q_wad + lumpinfo[lump].position);
++    return lumpcache[lump];
++
++    if (!lumpcache[lump])
+     {
+         // read the lump in
+ 
+@@ -516,10 +549,16 @@
+ //
+ // W_Profile
+ //
++// Qwenputer: no profile dump (it needs a writable file and a 100 KB table).
++void W_Profile (void)
++{
++}
++
++#if 0
+ int             info[2500][10];
+ int             profilecount;
+ 
+-void W_Profile (void)
++void W_Profile_vanilla (void)
+ {
+     int         i;
+     memblock_t* block;
+@@ -573,5 +612,6 @@
+     }
+     fclose (f);
+ }
++#endif
+ 
+ 
+diff --color -ruN a/src/z_zone.c b/src/z_zone.c
+--- a/src/z_zone.c	2026-10-29 05:20:35
++++ b/src/z_zone.c	2026-10-29 05:20:35
+@@ -121,11 +121,21 @@
+ //
+ // Z_Free
+ //
++// Qwenputer: lumps are mapped from the DROM, outside the zone.
++int Z_InZone (void* ptr)
++{
++    return (byte *)ptr > (byte *)mainzone
++        && (byte *)ptr < (byte *)mainzone + mainzone->size;
++}
++
+ void Z_Free (void* ptr)
+ {
+     memblock_t*         block;
+     memblock_t*         other;
+ 
++    if (!Z_InZone (ptr))
++        return;  // Qwenputer: a lump mapped from the DROM
++
+     block = (memblock_t *) ( (byte *)ptr - sizeof(memblock_t));
+ 
+     if (block->id != ZONEID)
+@@ -434,6 +444,8 @@
+ {
+     memblock_t* block;
+ 
++    if (!Z_InZone (ptr))
++        return;  // Qwenputer: a lump mapped from the DROM
+     block = (memblock_t *) ( (byte *)ptr - sizeof(memblock_t));
+ 
+     if (block->id != ZONEID)
+diff --color -ruN a/src/z_zone.h b/src/z_zone.h
+--- a/src/z_zone.h	2026-10-29 05:20:35
++++ b/src/z_zone.h	2026-10-29 05:20:35
+@@ -53,6 +53,7 @@
+ void    Z_FileDumpHeap (FILE *f);
+ void    Z_CheckHeap (void);
+ void    Z_ChangeTag2 (void *ptr, int tag);
++int     Z_InZone (void *ptr);
+ int     Z_FreeMemory (void);
+ 
+ 
+@@ -70,12 +71,7 @@
+ // This is used to get the local FILE:LINE info from CPP
+ // prior to really call the function in question.
+ //
+-#define Z_ChangeTag(p,t) \
+-{ \
+-      if (( (memblock_t *)( (byte *)(p) - sizeof(memblock_t)))->id!=0x1d4a11) \
+-          I_Error("Z_CT at "__FILE__":%i",__LINE__); \
+-          Z_ChangeTag2(p,t); \
+-};
++#define Z_ChangeTag(p,t) Z_ChangeTag2(p,t)  // Qwenputer: Z_ChangeTag2 checks the block
+ 
+ 
+ 

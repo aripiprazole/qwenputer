@@ -57,7 +57,7 @@ CODE_AMP = 128  # a token's code in its (tied) embedding row: CODE_AMP * (2 * bi
 KAPPA = 2.0**-20  # the predicted code after the exit: KAPPA * (2 * bit - 1)
 TAU_TEXT = 2.0**-40  # (P3) tau on text tokens; -1 on chip tokens (see q35.merge)
 PAY_W = {"V": 15, "F0": 15, "F1": 15, "F2": 2, "J": 16, "R": 16, "BYTE": 9, "FLT": 3, "HEX": 4,
-         "QS": 4, "QD": 7, "BD": 8}
+         "QS": 4, "QD": 7, "BD": 8, "DSP": 8}
 
 
 def code_bits(fam: str, p: int) -> list[int]:
@@ -372,9 +372,14 @@ def build(target: Target | None = None, text=None) -> RvCore:
 
     w = add_small(anchor, 0, 16, "w")
     w1 = add_small(anchor, 1, 17, "w+1")  # the link: PC + 4 = ROM_BASE + 4 * (w + 1)
-    assert S.ROM_BASE == 1 << 18 and S.ROM_WORDS == 1 << 16
-    pc_bits = [Expr(), Expr()] + w + [one] + [Expr()] * 13  # PC = 0x40000 + 4 w
-    link = [Expr()] * 2 + w1[:16] + [one - w1[16], w1[16]] + [Expr()] * 12
+    rb = S.ROM_BASE.bit_length() - 1  # PC = ROM_BASE + 4 w, ROM_BASE = 2^rb
+    assert S.ROM_BASE == 1 << rb >= 1 << 18 and S.ROM_WORDS == 1 << 16
+    pc_bits = [Expr(), Expr()] + w + [Expr()] * (rb - 18) + [one] + [Expr()] * (31 - rb)
+    if rb == 18:  # the link's carry out of w + 1 moves the base bit up
+        link = [Expr()] * 2 + w1[:16] + [one - w1[16], w1[16]] + [Expr()] * 12
+    else:
+        link = ([Expr()] * 2 + w1[:16] + [w1[16]] + [Expr()] * (rb - 19) + [one]
+                + [Expr()] * (31 - rb))
     # digits so far: nd = j - 1 - v inside a DIV record (QS at j = 0, then the digits)
     nd_int = sum(jt, Expr()) - 1 - sum(vt, Expr())
     nd_is = {v: c.node(c.t_eq(nd_int, v, -4, JMAX), f"nd=={v}") for v in range(1, 9)}
@@ -858,8 +863,10 @@ def build(target: Target | None = None, text=None) -> RvCore:
     # word index wi = EA[16:2] (DROM at 0x20000): key head wi[14:11] = EA[16:13], value head
     # wi[10] = EA[12], row pair (p, p + 64) with p = EA[11:6], half EA[5], word EA[4:2]
     ddims = c.zeros(4, "drom.b")
+    dhb = (S.DROM_WORDS >> 11).bit_length() - 1  # key head bits: EA[13:13 + dhb]
+    assert S.DROM_WORDS == 1 << 11 + dhb and S.DROM_BASE % (4 * S.DROM_WORDS) == 0
     for h in range(S.DROM_WORDS >> 11):
-        hl = lits_of(EA[13:17], h)
+        hl = lits_of(EA[13:13 + dhb], h)
         q = {}
         for p in range(64):
             e = andpre(lits_of(EA[6:12], p) + hl)
@@ -885,7 +892,9 @@ def build(target: Target | None = None, text=None) -> RvCore:
     # TEXT_ADDR + 16 i: row EA[10:4], value head EA[3], word EA[2]
     if text:
         tmem = c.zeros(32, "tmem")
-        tsel = [EA[15]] + [1 - EA[b] for b in range(11, 15)]
+        tb = S.TEXT_ADDR.bit_length() - 1  # TEXT_ADDR = 2^tb: EA[11:tb + 1] selects it
+        assert S.TEXT_ADDR == 1 << tb >= 1 << 11
+        tsel = lits_of(EA[11:tb + 1], S.TEXT_ADDR >> 11)
         q = {i: andpre(lits_of(EA[4:11], i) + tsel) for i in caprow}
         keys = {i: Chan(e) for i, e in caprow.items()}
         vhs = []
@@ -906,9 +915,10 @@ def build(target: Target | None = None, text=None) -> RvCore:
 
     # ---------------------------------------------------------------- loads, merge, compares
     lane = EA[0:2]
-    in_ram = c.and_([1 - b for b in EA[15:32]], "in_ram")
-    in_drom = c.and_([1 - b for b in EA[18:32]] + [EA[17]], "in_drom")
-    in_text = (c.and_(tsel + [1 - b for b in EA[16:32]], "in_text") if text else None)
+    ram_bits = (4 * S.RAM_WORDS).bit_length() - 1
+    in_ram = c.and_([1 - b for b in EA[ram_bits:32]], "in_ram")
+    in_drom = c.and_(lits_of(EA[13 + dhb:32], S.DROM_BASE >> 13 + dhb), "in_drom")
+    in_text = (c.and_(tsel + [1 - b for b in EA[tb + 1:32]], "in_text") if text else None)
     ld = []
     for i in range(32):
         terms = c.t_and([uops["LW"], mem[i], in_ram] + lits_of(lane, 0))
@@ -971,7 +981,8 @@ def build(target: Target | None = None, text=None) -> RvCore:
     loads = any_of(*RF.LOAD_OPS)
     halfs, words = any_of("LH", "LHU"), uops["LW"]
     s_halfs, s_words = uops["SH"], uops["SW"]
-    a7_is = {v: c.and_(lits_of(A, v), f"a7=={v}") for v in (1, 93)}
+    dsp = "DSP" in S.FAMILIES  # the display ecall (a7 = 2), "doom" map only
+    a7_is = {v: c.and_(lits_of(A, v), f"a7=={v}") for v in (1, 93) + ((2,) if dsp else ())}
     ecall = uops["ECALL"]
     mis_ld = c.node(c.t_and([halfs, EA[0]]) + c.t_and([words, EA[0]])
                     + c.t_and([words, 1 - EA[0], EA[1]]), "fault.misld")
@@ -983,14 +994,15 @@ def build(target: Target | None = None, text=None) -> RvCore:
     oor_st = c.node(c.t_and([is_store, 1 - mis_st])
                     + c.t_and([is_store, 1 - mis_st, in_ram], -1), "fault.oorst")
     jalr = uops["JALR"]
-    # a bad JALR target (EA & ~1): misaligned, or outside the ROM (EA[31:19] = 0, EA[18] = 1)
-    rom_ok = [1 - b for b in EA[19:32]] + [EA[18]]
+    # a bad JALR target (EA & ~1): misaligned, or outside the ROM (EA[31:18] = ROM_BASE >> 18)
+    rom_ok = lits_of(EA[18:32], S.ROM_BASE >> 18)
     fc6_terms = (c.t_and([jalr, EA[1]]) + c.t_and([jalr, 1 - EA[1]])
                  + c.t_and([jalr, 1 - EA[1]] + rom_ok, -1) + c.t_and([uops["JAL"], jbad]))
     fc = {0: c.and_([uops["ILLEGAL"]], "fault.0"), 1: c.and_([uops["EBREAK"]], "fault.1"),
           2: mis_ld, 3: mis_st, 4: oor_ld, 5: oor_st,
           7: c.node(c.t_and([ecall]) + c.t_and([ecall, a7_is[1]], -1)
-                    + c.t_and([ecall, a7_is[93]], -1), "fault.7")}
+                    + c.t_and([ecall, a7_is[93]], -1)
+                    + (c.t_and([ecall, a7_is[2]], -1) if dsp else []), "fault.7")}
 
     # ---------------------------------------------------------------- rd value, size, branch
     addish = any_of("ADD", "ADDI", "SUB")
@@ -1085,7 +1097,7 @@ def build(target: Target | None = None, text=None) -> RvCore:
     case(nr + [branches, taken], "J", btgt)
     case(nr + [branches, 1 - taken], "NT")
     case(nr + [uops["JAL"]], "J", jtgt)
-    case(nr + [uops["JALR"]], "J", EA[2:18])  # word = (EA - 0x40000) >> 2
+    case(nr + [uops["JALR"]], "J", EA[2:18])  # word = (EA - ROM_BASE) >> 2
     case(nr + [uops["SW"], 1 - EA[6]], "ST0")
     case(nr + [uops["SW"], EA[6]], "ST1")
     sbsh = any_of("SB", "SH")
@@ -1096,6 +1108,8 @@ def build(target: Target | None = None, text=None) -> RvCore:
     case([j3, ok, sbsh, EA[6]], "SS1")
     case(nr + [ecall, a7_is[1]], "BYTE", B[0:9])  # a byte, or (256..) a P3 special token
     case(nr + [ecall, a7_is[93]], "HALT")
+    if dsp:
+        case(nr + [ecall, a7_is[2]], "DSP", B[0:8])
     case(nr + [uops["FENCE"]], "NT")
     # digit-file ops: BD per digit (j < n), then rd = the last carry (or NT)
     for start in ([j0, one - at_max], [one - j0]):
@@ -1257,17 +1271,17 @@ def snapshot(c: RvCore, m: "RF.Machine") -> None:
                     rows[r] = row
                 vh.append(rows)
             c.tables[f"bn{port}.{h}"].init = vh
-    for h in range(S.RAM_WORDS >> 8):
-        r0, r1 = {}, {}
-        for wi in range(S.RAM_WORDS):
-            if (wi & 15 | (wi >> 12) << 4) != h or not m.ram[wi]:
-                continue
-            row = np.zeros(HD)
-            row[list(REF_COLS)] = A_REF
-            for i in range(32):
-                row[2 + i] = A_BIT * (m.ram[wi] >> i & 1)
-            (r1 if wi >> 4 & 1 else r0)[wi >> 5 & 127] = row
-        c.tables[f"ram{h}"].init = [r0, r1]
+    rows = [([{}, {}]) for _ in range(S.RAM_WORDS >> 8)]
+    for wi, word in enumerate(m.ram):
+        if not word:
+            continue
+        row = np.zeros(HD)
+        row[list(REF_COLS)] = A_REF
+        for i in range(32):
+            row[2 + i] = A_BIT * (word >> i & 1)
+        rows[wi & 15 | (wi >> 12) << 4][wi >> 4 & 1][wi >> 5 & 127] = row
+    for h, r in enumerate(rows):
+        c.tables[f"ram{h}"].init = r
 
 
 def decode_code(fid: int, p: int, text=None) -> int:

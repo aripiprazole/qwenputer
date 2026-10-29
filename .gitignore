@@ -10,3 +10,7 @@ __pycache__/
 /games/sources/
 /games/shots/
 /dist/
+/.qwenputer.local.json
+
+# Doom firmware: it embeds the shareware WAD (built by env/doom/build.py)
+experimental/riscv/chipformer/rv/env/doom/doom.elf

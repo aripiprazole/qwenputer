@@ -219,7 +219,7 @@ def build_merged(src, dst, mute_qwen: bool = True, hidden: int | None = None,
            "pad_token_id": tc0.get("eos_token_id", 248044), "bad_words_ids": [[IM_START]],
            "do_sample": False}
     (dst / "generation_config.json").write_text(json.dumps(gen, indent=2))
-    meta = {"layout": "rv1", "chip_token_offset": v0, "chip_vocab": S.VOCAB,
+    meta = {"layout": "rv1", "map": S.MAP, "chip_token_offset": v0, "chip_vocab": S.VOCAB,
             "chip_layers": n_chip, "qwen_layers_from": n_chip, "hidden": hidden,
             "chip_dims_offset": d0, "ballast_dims": m, "circuit": c.stats(),
             "slots": alloc.n_slots, "muted": mute_qwen,

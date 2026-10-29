@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "$0")" && pwd)
+python=${QWENPUTER_PYTHON:-python3}
+for arg in "$@"; do
+  case "$arg" in
+    --self-test|--demo)
+      if [[ -z ${QWENPUTER_PYTHON:-} ]]; then
+        if [[ -x "$root/.venv/bin/python" ]]; then
+          python="$root/.venv/bin/python"
+        elif [[ -x "$root/../qwen/.venv/bin/python" ]]; then
+          python="$root/../qwen/.venv/bin/python"
+        fi
+      fi
+      ;;
+  esac
+done
+export PYTHONDONTWRITEBYTECODE=1
+exec "$python" "$root/experimental/riscv/chipformer/rv/neural_harness.py" "$@"
