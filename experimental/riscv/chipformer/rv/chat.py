@@ -85,16 +85,40 @@ class ExecRow:
 
         self.chat = chat
         cuda = torch.device(chat.dev).type == "cuda"
-        self.ex = Executor2(chat.c, 1, chat.dev, fuse=chat.fuse, pdl=cuda, early=cuda,
+        # programmatic dependent launch (griddepcontrol) needs sm_90 or newer
+        pdl = cuda and torch.cuda.get_device_capability(chat.dev)[0] >= 9
+        self.ex = Executor2(chat.c, 1, chat.dev, fuse=chat.fuse, pdl=pdl, early=pdl,
                             direct=cuda)
         if cuda:
-            self.ex.tune(self.ex.embed([S.tok("GO")]))
+            self._tune()
         self.heads = [st for st in self.ex.steps if st["kind"] == "head"]
         self.xbuf = torch.zeros(1, self.ex.D, device=chat.dev)
         self.kbuf = torch.zeros(len(chat.keep_cols), device=chat.dev)
         self.graph = None
         self.loop = None
         self.fused = cuda  # the device loop's decode + embedding as one Triton kernel
+
+    def _tune(self) -> None:
+        """Each step's launch config: tuned once per GPU and map (compiling every candidate
+        kernel takes long on a fresh Triton cache), then read back from next to the checkpoint.
+        QWENPUTER_TUNE=0 keeps the default configs."""
+        import os
+
+        if os.environ.get("QWENPUTER_TUNE") == "0":
+            return
+        gpu = torch.cuda.get_device_name(self.chat.dev).replace(" ", "_")
+        cache = self.chat.path / f"exec_tune.{S.MAP}.{gpu}.json"
+        if cache.is_file():
+            cfgs = json.loads(cache.read_text())
+            if len(cfgs) == len(self.ex.steps):
+                for st, cfg in zip(self.ex.steps, cfgs):
+                    st["cfg"] = tuple(cfg)
+                return
+        chosen = self.ex.tune(self.ex.embed([S.tok("GO")]))
+        try:
+            cache.write_text(json.dumps([list(c) for c in chosen]))
+        except OSError:
+            pass
 
     def save(self, steps: int = 0) -> ExecState:
         return ExecState(tuple(st["S"][0].clone() for st in self.heads), steps)

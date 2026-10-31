@@ -26,6 +26,8 @@ from chipformer.rv import spec as S
 
 # special tokens the firmware prints with putchar(256 + k)
 SPECIALS = ["<tool_response>", "</tool_response>", "<think>", "</think>"]
+if S.INSIDE:  # the guest writes the chat template and tool calls itself
+    SPECIALS += ["<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>"]
 
 
 def bytes_to_unicode() -> dict[int, str]:
@@ -64,6 +66,10 @@ class Text:
         self.TCO, self.TCC = ids["<tool_call>"], ids["</tool_call>"]
         u = bytes_to_unicode()
         self.printable = [ids[u[b]] for b in range(256)] + [ids[s] for s in SPECIALS]
+        if S.INSIDE:  # the guest's pre-tokenized text (env/inside/tokens.json): 264 + j
+            import json
+            table = Path(__file__).parent / "env/inside/tokens.json"
+            self.printable += json.loads(table.read_text())
         self.pindex = {q: p for p, q in enumerate(self.printable)}
         self.NL = self.printable[10]
 
@@ -177,6 +183,40 @@ class Session:
             raise RuntimeError("the run did not halt")
         if m.fault is None:
             m.halted = False  # parked: the next GO resumes after the exit ecall
+        self.runs.append(echo)
+        return echo
+
+    def wake(self, qid: int, max_records: int = 10**6) -> list[int]:
+        """("inside") A text token written while the guest is parked (Qwen's, or a key at a KWT):
+        it goes into text row 1, and the circuit predicts GO; the guest runs until it parks
+        again (YLD / KWT). Returns the run's echoed Qwen tokens."""
+        rows = list(self.m.text)
+        rows[1] = self.T.row_bytes(qid)
+        self.m.text = rows
+        self._push(text_token(qid), True)
+        return self.inside_run(max_records)
+
+    def inside_run(self, max_records: int = 10**6) -> list[int]:
+        """GO, then the guest's records until it parks with YLD / KWT (no echo after it)."""
+        m, echo = self.m, []
+        self._push(S.tok("GO"), True)
+        m.halted, m.released = False, None
+        for _ in range(max_records):
+            rec = m.record()
+            for t in rec:
+                self._push(t, True)
+                fam, p = S.family(t)
+                if fam == "BYTE":
+                    q = self.T.printable[p] if p < len(self.T.printable) else self.T.NL
+                    echo.append(q)
+                    self._push(text_token(q), True)
+            if m.halted:
+                break
+        else:
+            raise RuntimeError("the run did not park")
+        if m.released is None:  # exit or a fault: the circuit echoes the newline and owns on
+            raise RuntimeError(f"the guest stopped: fault {m.fault}, exit {m.exit_code}")
+        self.own[-1] = False  # YLD / KWT: the next position is Qwen's or the keyboard's
         self.runs.append(echo)
         return echo
 

@@ -417,6 +417,7 @@ class Machine:
     screen: bytearray = field(default_factory=bytearray)  # display output (DSP)
     fault: tuple[int, int] | None = None  # (cause, pc) of the fault that halted the run
     exit_code: int | None = None
+    released: str | None = None  # "inside": the park's control (YLD / KWT), None after exit
 
     @property
     def pc(self) -> int:
@@ -528,6 +529,10 @@ class Machine:
                 self.screen.append(b & 0xFF)
                 self.n += 1
                 return [S.tok("DSP", b & 0xFF)]
+            if a in (3, 4) and S.INSIDE:  # yield to Qwen / wait for a key: park, no echo
+                self.halted, self.released = True, "YLD" if a == 3 else "KWT"
+                self.n += 1
+                return [S.tok(self.released)]
             if a == 93:  # exit(a0)
                 self.halted, self.exit_code = True, b
                 self.n += 1

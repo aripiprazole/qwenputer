@@ -332,18 +332,26 @@ def build(target: Target | None = None, text=None) -> RvCore:
 
     if text:  # ------------------------------------------------ P3 bridge state
         isGO, isHALT = fam["GO"], fam["HALT"]
-        # running: from GO to HALT; armed: inside a tool call (its text is captured)
+        parks = isHALT + (fam["YLD"] + fam["KWT"] if S.INSIDE else 0)
+        # running: from GO to HALT (inside: or a YLD / KWT park)
         ((running,),) = thead(c, "run", {0: one}, {0: one},
-                              [{"data": {2: isGO}, "ref": one, "beta": isGO + isHALT}])
+                              [{"data": {2: isGO}, "ref": one, "beta": isGO + parks}])
         c.tables["run"] = c.nodes[-1]
-        ((armed,),) = thead(c, "arm", {0: one}, {0: one},
-                            [{"data": {2: c.isTCO}, "ref": one, "beta": c.isTCO + c.isTCC}])
-        c.tables["arm"] = c.nodes[-1]
-        capw = c.and_([c.is_text, armed, one - c.isTCO], "cap.w")  # a captured text token
-        xcap = c.counter("cap", c.isTCO, capw)  # its index (1, 2, ..) since <tool_call>
-        capt = c.thermo(xcap, c.isTCO, S.CAP_MAX, "cap")
-        caprow = {i: capt[i - 1] - (capt[i] if i < S.CAP_MAX else 0)
-                  for i in range(1, S.CAP_MAX + 1)}
+        if S.INSIDE:
+            # every text token that arrives while the guest is parked wakes it: it overwrites
+            # text row 1, and the circuit predicts GO
+            wake = c.and_([c.is_text, one - running], "wake")
+            capw, caprow = wake, {1: wake}
+        else:
+            # armed: inside a tool call (its text is captured)
+            ((armed,),) = thead(c, "arm", {0: one}, {0: one},
+                                [{"data": {2: c.isTCO}, "ref": one, "beta": c.isTCO + c.isTCC}])
+            c.tables["arm"] = c.nodes[-1]
+            capw = c.and_([c.is_text, armed, one - c.isTCO], "cap.w")  # a captured text token
+            xcap = c.counter("cap", c.isTCO, capw)  # its index (1, 2, ..) since <tool_call>
+            capt = c.thermo(xcap, c.isTCO, S.CAP_MAX, "cap")
+            caprow = {i: capt[i - 1] - (capt[i] if i < S.CAP_MAX else 0)
+                      for i in range(1, S.CAP_MAX + 1)}
 
     # ---------------------------------------------------------------- L2: PC word, link, nd
     def add_small(abits, extra, nb, name):
@@ -910,7 +918,7 @@ def build(target: Target | None = None, text=None) -> RvCore:
             for rc in REF_COLS:
                 v[rc] = chan(one, A_REF)
             vhs.append({"v": v, "z": z, "outs": outs, "into": into, "beta": capw,
-                        "a": 238 * c.isTCO})  # cleared at <tool_call>
+                        "a": 0 if S.INSIDE else 238 * c.isTCO})  # cleared at <tool_call>
         c.table("tbuf", q, keys, vhs)
 
     # ---------------------------------------------------------------- loads, merge, compares
@@ -982,7 +990,8 @@ def build(target: Target | None = None, text=None) -> RvCore:
     halfs, words = any_of("LH", "LHU"), uops["LW"]
     s_halfs, s_words = uops["SH"], uops["SW"]
     dsp = "DSP" in S.FAMILIES  # the display ecall (a7 = 2), "doom" map only
-    a7_is = {v: c.and_(lits_of(A, v), f"a7=={v}") for v in (1, 93) + ((2,) if dsp else ())}
+    calls = (1, 93) + ((2,) if dsp else ()) + ((3, 4) if S.INSIDE else ())
+    a7_is = {v: c.and_(lits_of(A, v), f"a7=={v}") for v in calls}
     ecall = uops["ECALL"]
     mis_ld = c.node(c.t_and([halfs, EA[0]]) + c.t_and([words, EA[0]])
                     + c.t_and([words, 1 - EA[0], EA[1]]), "fault.misld")
@@ -1000,9 +1009,8 @@ def build(target: Target | None = None, text=None) -> RvCore:
                  + c.t_and([jalr, 1 - EA[1]] + rom_ok, -1) + c.t_and([uops["JAL"], jbad]))
     fc = {0: c.and_([uops["ILLEGAL"]], "fault.0"), 1: c.and_([uops["EBREAK"]], "fault.1"),
           2: mis_ld, 3: mis_st, 4: oor_ld, 5: oor_st,
-          7: c.node(c.t_and([ecall]) + c.t_and([ecall, a7_is[1]], -1)
-                    + c.t_and([ecall, a7_is[93]], -1)
-                    + (c.t_and([ecall, a7_is[2]], -1) if dsp else []), "fault.7")}
+          7: c.node(c.t_and([ecall])
+                    + sum((c.t_and([ecall, a7_is[v]], -1) for v in calls), []), "fault.7")}
 
     # ---------------------------------------------------------------- rd value, size, branch
     addish = any_of("ADD", "ADDI", "SUB")
@@ -1072,7 +1080,8 @@ def build(target: Target | None = None, text=None) -> RvCore:
     cases = []  # (literals, family, payload bits or int)
     # P3: at a BYTE / HALT the next token is the echo (a Qwen token), at </tool_call> it is GO;
     # every other case is off there
-    nb = [one - fam["BYTE"] - fam["HALT"] - c.isTCC] if text else []
+    gate = wake if text and S.INSIDE else (c.isTCC if text else None)  # the GO position
+    nb = [one - fam["BYTE"] - fam["HALT"] - gate] if text else []
 
     def case(lits, fam_name, payload=0):
         cases.append((lits + nb, fam_name, payload))
@@ -1110,6 +1119,9 @@ def build(target: Target | None = None, text=None) -> RvCore:
     case(nr + [ecall, a7_is[93]], "HALT")
     if dsp:
         case(nr + [ecall, a7_is[2]], "DSP", B[0:8])
+    if S.INSIDE:
+        case(nr + [ecall, a7_is[3]], "YLD")
+        case(nr + [ecall, a7_is[4]], "KWT")
     case(nr + [uops["FENCE"]], "NT")
     # digit-file ops: BD per digit (j < n), then rd = the last carry (or NT)
     for start in ([j0, one - at_max], [one - j0]):
@@ -1135,10 +1147,11 @@ def build(target: Target | None = None, text=None) -> RvCore:
         cases.append(([fam["BYTE"]], "Q", c.pay["BYTE"]))
         nl = text.printable_index(text.NL)  # a run ends in a newline
         cases.append(([fam["HALT"]], "Q", [one if nl >> i & 1 else Expr() for i in range(9)]))
-        cases.append(([c.isTCC], "GO", 0))
-        # who predicts the next token: the circuit from </tool_call> through a run's last echo
-        owner = c.node(c.t_and([running]) + c.t_and([fam["HALT"]])
-                       + c.t_and([c.isTCC, one - running]), "owner")
+        cases.append(([gate], "GO", 0))
+        # who predicts the next token: the circuit from </tool_call> (inside: from any text token
+        # while parked) through a run's last echo; after YLD / KWT, Qwen or the keyboard
+        waking = [wake] if S.INSIDE else [c.isTCC, one - running]
+        owner = c.node(c.t_and([running]) + c.t_and([fam["HALT"]]) + c.t_and(waking), "owner")
     c.owner = owner
     own = [owner] if text else []
     fam_cases = [(l_, FAM_ID[fn]) for l_, fn, _ in cases]

@@ -244,6 +244,135 @@ Measured on a RunPod RTX PRO 6000:
 
 It plays turn by turn, not in real time.
 
+## The chat harness inside the circuit
+
+<p align="center"><a href="docs/harness-inside.mp4"><img src="docs/harness-inside.gif" alt="The raw chat harness running as a WebAssembly module inside the RV32 guest in Qwen's layers: the prompt, the streamed reply and the tool records are drawn by the guest." width="100%"></a></p>
+
+<p align="center"><sub>A live session on a RunPod H200 (<a href="docs/harness-inside.mp4">MP4</a>). It resumes the booted guest from its cache. The waits are fast-forwarded and the badge says by how much: the 99 s clip covers 10.5 minutes.</sub></p>
+
+What the video shows, all drawn by the guest:
+
+1. **"Run this in the harness: 1234 5678 * ."** Qwen calls the harness. The guest runs the
+   program and draws the tool record (`7006652`), and Qwen answers from the tool response.
+2. **"Define a cube word …"** Qwen defines `: cube dup dup * * ;`, then runs `7 cube .` (`343`).
+3. **"Change the cube word in your harness so it prints the input number first …"** Qwen
+   rewrites its own harness code, `: cube dup . dup dup * * ;`, and `12 cube .` now prints
+   `12 1728`.
+4. **"Run 3 cube . with your changed word."** gives `3 27`. The changed word persists across turns.
+
+The dictionary is the part of the harness Qwen can change at runtime: words in the guest's RAM,
+defined, redefined and forgotten on the fly. The wasm module and the RV32 code are fixed: the
+circuit fetches instructions only from ROM, and wasm3 compiles the module once at boot.
+
+Here the whole chat harness runs **inside** the model. The prompt, the line editor, the chat
+template, the turn loop, the tool-call parsing, the guest's Forth dictionary and the terminal
+drawing are a WebAssembly module. [wasm3](https://github.com/wasm3/wasm3) (v0.5.0, compiled for
+rv32im) interprets that module as RV32 firmware, and the firmware runs in the circuit layers in
+front of Qwen3.5-4B. The guest drives the conversation and talks to the outer Qwen through the
+token stream. It writes everything Qwen reads, hands positions to Qwen, and is woken by every
+token Qwen writes.
+
+The host has no chat logic. It has no template, no tokenizer call, no stop rule and no
+formatting. It does four things:
+
+1. It runs the layers and feeds each predicted token back.
+2. It copies the guest's display tokens to the terminal.
+3. It turns key presses into tokens that only the circuit reads.
+4. It loads the checkpoint and the firmware.
+
+### How the guest drives Qwen
+
+The `inside` address map (`QWENPUTER_RV_MAP=inside`) is the DOOM map (1 MB of RAM, 4 MB of
+read-only data) with four additions to the compiled circuit:
+
+- **Wake on any token.** Any text token that arrives while the guest is parked makes the circuit
+  predict `GO`. The token's bytes are in text row 1. The circuit no longer waits for
+  `</tool_call>`, so the guest sees Qwen's reply token by token.
+- **Two parks with no echo.** `ecall a7=3` (`YLD`) hands the next position to Qwen. `ecall a7=4`
+  (`KWT`) hands it to the keyboard. Neither writes anything into Qwen's context. A key's token
+  goes through the chip layers only, so Qwen never sees keystrokes.
+- **The chat's special tokens.** The guest can write `<|im_start|>`, `<|im_end|>`, `<tool_call>`
+  and `</tool_call>` itself (`putchar(256 + k)`), so it renders the chat template.
+- **The display** (`ecall a7=2`), as in DOOM: bytes for the terminal that Qwen never reads.
+
+A turn, all decided by the guest:
+
+1. The guest draws the prompt and waits for keys, one `KWT` per key.
+2. On Enter it writes `<|im_start|>user …<|im_end|><|im_start|>assistant` into Qwen's context.
+3. It yields with `YLD`. Each token Qwen writes wakes the guest, which streams it to the screen.
+4. When Qwen closes a tool call, the guest runs the command in its Forth interpreter, draws the
+   tool record, writes the `<tool_response>` into Qwen's context, and yields again.
+5. When Qwen writes `<|im_end|>`, the turn is over and the guest draws the prompt again.
+
+Firmware: [`env/inside/`](experimental/riscv/chipformer/rv/env/inside). `firmware.c` hosts
+wasm3, and wasm3 is entered once. The module's own `run()` loop calls `model_yield` as an
+import, so a streamed Qwen token costs one import call. `harness.c` is the module, built with
+clang `--target=wasm32` and linked into the firmware's read-only data.
+
+### Checks
+
+- `insidefixture.py`: the compiled circuit, run on the CPU, matches the reference machine token
+  for token. It predicts every token it owns, and owns no position after a `YLD` or `KWT`.
+- `insidecheck.py`: a fixture with the reference machine and scripted replies, no model. It
+  boots the firmware, types three requests, and plays Qwen's side from fixed strings. It checks
+  Qwen's context against the chat template's own rendering, and the terminal output.
+- The existing RV suites pass unchanged (234 passed): the default and `doom` maps compile the
+  same circuit as before.
+
+### Cost
+
+From the reference fixture, in guest instructions:
+
+| | instructions | circuit tokens |
+| --- | --- | --- |
+| Boot: wasm3 setup, module parse and compile, system prompt | 2.92M | 3.62M |
+| Streamed Qwen token (median) | 812 | about 1,000 |
+| Key press (median) | 575 | about 700 |
+| Tool call with its response | 42–68k | 55–89k |
+
+The system turn (the system prompt and the tool's definition) and the turn pieces are written
+as Qwen's own tokens: 456 tokens instead of about 2,000 single bytes. `build.py` tokenizes them
+with Qwen's tokenizer at build time. The firmware stores them as data, and the 212 tokens they
+use beyond the bytes and special tokens are appended to the guest-writable token table
+(`tokens.json`). When the guest wrote the long system turn one byte per token, Qwen's tool calls
+came out misspelled (`<fuction=harne>`, `<param=command>`). Typed text and tool output are still
+written one byte per token.
+
+### Timing of the live session
+
+Measured on a RunPod H200 (community cloud), with the fused executor and untuned launch
+configs:
+
+- **Circuit:** 2,573 circuit tokens/s in the device token loop, and about 1,817/s on average
+  over a chat session.
+- **Boot:** 3,618,631 circuit tokens, plus 456 tokens written into Qwen's context, in 23.5 min.
+  That is the reference fixture's count, token for token. It runs once per firmware: the parked
+  guest, with Qwen's cache of the system turn, is saved next to the checkpoint, and later
+  sessions resume from it after the model loads (about 40 s).
+- **Chat, end to end:** 197 Qwen tokens, 147 key presses and 3 tool runs in 387 s, about 0.5
+  Qwen tokens/s. Each token Qwen writes wakes the guest for about 1,000 circuit tokens, and each
+  key press for about 950. Text decoding (Qwen's own layers) was not timed separately.
+
+On an A100 the same circuit ran at 1,790 circuit tokens/s (fused, no programmatic dependent
+launch), and at 495/s unfused.
+
+### Replicate
+
+```bash
+# a CUDA host with ≥ 64 GB of GPU memory (the merged checkpoint is 47 GB)
+python3 -m venv .venv && .venv/bin/pip install torch==2.8.0 'transformers>=5.21' safetensors numpy \
+    'flash-linear-attention==0.3.2'
+hf download Qwen/Qwen3.5-4B --local-dir /workspace/Qwen3.5-4B
+QWENPUTER_RV_MAP=inside .venv/bin/python -m chipformer.rv.merge /workspace/Qwen3.5-4B \
+    --out /workspace/q4-inside
+QWENPUTER_RV_MAP=inside .venv/bin/python -m chipformer.rv.inside_harness --server \
+    --model /workspace/q4-inside      # the first run boots the guest and caches it
+```
+
+Ctrl-\ ends the session; that is the host's only key. The firmware is built with
+`QWENPUTER_RV_MAP=inside python chipformer/rv/env/inside/build.py` from `experimental/riscv`
+(LLVM clang and lld, as for DOOM; it fetches wasm3 v0.5.0 and checks its sha256).
+
 ## Benchmarks
 
 Greedy decoding, 40 problems per set. Each row compares base Qwen3.5-4B and Qwenputer on the same

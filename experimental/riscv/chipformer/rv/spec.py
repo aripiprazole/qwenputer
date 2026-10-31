@@ -62,7 +62,8 @@ FAMILY_SIZES = [("V", 1 << 15), ("F0", 1 << 15), ("F1", 1 << 15), ("F2", 4), ("J
                 ("R", 1 << 16), ("BYTE", 512), ("FLT", 8), ("HEX", 16), ("QS", 16), ("QD", 128),
                 ("BD", 256)]
 MAP = os.environ.get("QWENPUTER_RV_MAP", "p2")
-if MAP == "doom":
+INSIDE = MAP == "inside"
+if MAP in ("doom", "inside"):
     # DSP: final; a display byte (ecall a7 = 2, a0 & 255). A chip token the host shows on the
     # terminal and Qwen never reads, so a game frame does not enter the conversation.
     FAMILY_SIZES.append(("DSP", 256))
@@ -73,10 +74,17 @@ for _n, _s in FAMILY_SIZES:
     _base += _s
 CTRL = _base
 CONTROL_NAMES = ["NT", "ST0", "ST1", "SS0", "SS1", "HALT", "GO", "SC"]
+if INSIDE:
+    # "inside" (QWENPUTER_RV_MAP=inside): the guest drives the conversation. YLD (ecall a7 = 3)
+    # hands the next position to Qwen and KWT (a7 = 4) to the keyboard, both without an echo;
+    # every text token that arrives while the guest is parked wakes it (GO), with that token's
+    # bytes in text row 1.
+    CONTROL_NAMES += ["YLD", "KWT"]
 CONTROLS = {n: CTRL + i for i, n in enumerate(CONTROL_NAMES)}
 VOCAB = CTRL + len(CONTROL_NAMES)
 FINAL = {"F0", "F1", "F2", "J", "R", "BYTE", "NT", "ST0", "ST1", "SS0", "SS1", "HALT"}
 FINAL |= {"DSP"} if "DSP" in FAMILIES else set()
+FINAL |= {"YLD", "KWT"} if INSIDE else set()
 PAYLOAD_BITS = {n: (s - 1).bit_length() for n, s in FAMILY_SIZES}
 
 FAULTS = ["illegal", "ebreak", "misaligned load", "misaligned store", "load out of range",
@@ -85,7 +93,7 @@ FAULTS = ["illegal", "ebreak", "misaligned load", "misaligned store", "load out 
 # The address map. "p2" is the published machine. "doom" (QWENPUTER_RV_MAP=doom) widens RAM to
 # 1 MB and the DROM to 4 MB for the Doom firmware (env/doom); every region stays a power-of-two
 # block at a power-of-two base, so the circuit decodes it from address bits alone.
-if MAP == "doom":
+if MAP in ("doom", "inside"):
     ROM_BASE, ROM_WORDS = 1 << 25, 1 << 16  # 256 KB of code
     DROM_BASE, DROM_WORDS = 1 << 24, 1 << 20  # 4 MB of read-only data (rodata, then the WAD)
     RAM_BASE, RAM_WORDS = 0x0, 1 << 18  # 1 MB
